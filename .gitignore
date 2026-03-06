@@ -20,6 +20,9 @@ expo-env.d.ts
 
 # Metro
 .metro-health-check*
+.metro-cache/
+.metro-tmp/
+.tmp/
 
 # debug
 npm-debug.*
@@ -35,6 +38,11 @@ yarn-error.*
 
 # typescript
 *.tsbuildinfo
+
+# Python
+__pycache__/
+*.pyc
+server/venv/
 
 app-example
 

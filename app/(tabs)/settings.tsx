@@ -509,11 +509,11 @@ export default function SettingsScreen() {
 
   const confirmDeleteMyData = () => {
     Alert.alert(
-      "Delete my data?",
-      "This will permanently delete your health metrics, alerts, and consent settings. Your account will stay active.",
+      "Request data deletion?",
+      "This will send a request to the admin to delete your health metrics, alerts, and consent settings.",
       [
         { text: "Cancel", style: "cancel" },
-        { text: "Delete", style: "destructive", onPress: handleDeleteMyData },
+        { text: "Send request", style: "destructive", onPress: handleDeleteMyData },
       ]
     );
   };
@@ -521,8 +521,12 @@ export default function SettingsScreen() {
   const handleDeleteMyData = async () => {
     try {
       setDeletingData(true);
-      await apiFetch("/me/data", { method: "DELETE" });
-      Alert.alert("Deleted", "Your personal data has been deleted.");
+      const res = await apiFetch("/me/data", { method: "DELETE" });
+      const data = await res.json().catch(() => ({} as any));
+      Alert.alert(
+        "Request sent",
+        data?.detail || "Your data deletion request has been sent to admin."
+      );
     } catch (e: any) {
       Alert.alert("Delete failed", e?.message ?? "Something went wrong");
     } finally {
@@ -532,11 +536,11 @@ export default function SettingsScreen() {
 
   const confirmDeleteAccount = () => {
     Alert.alert(
-      "Delete account?",
-      "This will permanently delete your account and associated data. This cannot be undone.",
+      "Request account deletion?",
+      "This will send a request to the admin to delete your account and associated data.",
       [
         { text: "Cancel", style: "cancel" },
-        { text: "Delete account", style: "destructive", onPress: handleDeleteAccount },
+        { text: "Send request", style: "destructive", onPress: handleDeleteAccount },
       ]
     );
   };
@@ -544,10 +548,12 @@ export default function SettingsScreen() {
   const handleDeleteAccount = async () => {
     try {
       setDeletingAccount(true);
-      await apiFetch("/me", { method: "DELETE" });
-      await clearToken();
-      Alert.alert("Account deleted", "Your account has been deleted.");
-      router.replace("/(auth)/login");
+      const res = await apiFetch("/me", { method: "DELETE" });
+      const data = await res.json().catch(() => ({} as any));
+      Alert.alert(
+        "Request sent",
+        data?.detail || "Your account deletion request has been sent to admin."
+      );
     } catch (e: any) {
       Alert.alert("Delete failed", e?.message ?? "Something went wrong");
     } finally {

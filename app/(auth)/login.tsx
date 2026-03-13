@@ -123,6 +123,14 @@ export default function LoginScreen() {
               No account? <Text style={styles.linkAccent}>Sign up</Text>
             </Text>
           </TouchableOpacity>
+
+          <TouchableOpacity
+            onPress={() => router.push("/admin")}
+            activeOpacity={0.85}
+            style={styles.adminButton}
+          >
+            <Text style={styles.adminButtonText}>Admin login</Text>
+          </TouchableOpacity>
         </View>
       </View>
     </KeyboardAvoidingView>
@@ -244,6 +252,23 @@ const styles = StyleSheet.create({
   },
   linkAccent: {
     color: "#60a5fa",
+    fontWeight: "800",
+  },
+  adminButton: {
+    marginTop: 12,
+    alignSelf: "center",
+    minWidth: 170,
+    borderRadius: 14,
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    alignItems: "center",
+    backgroundColor: "rgba(255,255,255,0.10)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.20)",
+  },
+  adminButtonText: {
+    color: "#dbeafe",
+    fontSize: 14,
     fontWeight: "800",
   },
 });

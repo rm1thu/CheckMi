@@ -5,7 +5,9 @@ import React, { useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
+  KeyboardAvoidingView,
   Modal,
+  Platform,
   ScrollView,
   Share,
   StyleSheet,
@@ -66,6 +68,17 @@ type AlertItem = {
 type FamilyGoals = {
   steps: number;
   sleep: number;
+};
+
+type FamilyChatMessage = {
+  id: number;
+  familyId: number;
+  userId: number;
+  userName: string;
+  userRole: string;
+  message: string;
+  parentId?: number | null;
+  createdAt: string;
 };
 
 const BASE_URL = getApiBaseUrl();
@@ -177,6 +190,11 @@ export default function DashboardScreen() {
   const [alerts, setAlerts] = useState<AlertItem[]>([]);
   const [alertsOpen, setAlertsOpen] = useState(false);
   const [alertsLoading, setAlertsLoading] = useState(false);
+  const [chatOpen, setChatOpen] = useState(false);
+  const [chatLoading, setChatLoading] = useState(false);
+  const [chatSending, setChatSending] = useState(false);
+  const [chatInput, setChatInput] = useState("");
+  const [chatMessages, setChatMessages] = useState<FamilyChatMessage[]>([]);
 
   const [goals, setGoals] = useState<FamilyGoals>({ steps: 10000, sleep: 8 });
   const [goalsOpen, setGoalsOpen] = useState(false);
@@ -248,6 +266,13 @@ export default function DashboardScreen() {
     if (!res.ok) throw new Error(`Failed to load alerts: ${res.status}`);
     const data: AlertItem[] = await res.json();
     setAlerts(Array.isArray(data) ? data : []);
+  };
+
+  const loadChatMessages = async () => {
+    const res = await authFetch(`${BASE_URL}/family/chat/messages`);
+    if (!res.ok) throw new Error(`Failed to load family chat: ${res.status}`);
+    const data: FamilyChatMessage[] = await res.json();
+    setChatMessages(Array.isArray(data) ? data : []);
   };
 
   const loadFamilyGoals = async () => {
@@ -383,6 +408,45 @@ export default function DashboardScreen() {
       Alert.alert("Could not load alerts", err?.message || "Try again.");
     } finally {
       setAlertsLoading(false);
+    }
+  };
+
+  const openChatModal = async () => {
+    try {
+      setChatLoading(true);
+      await loadChatMessages();
+      setChatOpen(true);
+    } catch (err: any) {
+      Alert.alert("Could not load family chat", err?.message || "Try again.");
+    } finally {
+      setChatLoading(false);
+    }
+  };
+
+  const sendChatMessage = async () => {
+    const message = chatInput.trim();
+    if (!message) return;
+
+    try {
+      setChatSending(true);
+      const res = await authFetch(`${BASE_URL}/family/chat/messages`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message }),
+      });
+
+      const data = await res.json().catch(() => ({} as any));
+      if (!res.ok) {
+        Alert.alert("Could not send message", data?.detail || `Status ${res.status}`);
+        return;
+      }
+
+      setChatMessages((prev) => [...prev, data as FamilyChatMessage]);
+      setChatInput("");
+    } catch (err: any) {
+      Alert.alert("Could not send message", err?.message || "Try again.");
+    } finally {
+      setChatSending(false);
     }
   };
 
@@ -639,6 +703,18 @@ export default function DashboardScreen() {
           >
             <Text style={styles.shareBtnText}>
               {alertsLoading ? "Loading..." : `Alerts${unread.length ? ` (${unread.length})` : ""}`}
+            </Text>
+          </TouchableOpacity>
+        </View>
+
+        <View style={{ marginBottom: 12 }}>
+          <TouchableOpacity
+            style={[styles.shareBtn, { backgroundColor: theme.primaryStrong }]}
+            onPress={openChatModal}
+            disabled={chatLoading}
+          >
+            <Text style={styles.shareBtnText}>
+              {chatLoading ? "Loading..." : "Family chat"}
             </Text>
           </TouchableOpacity>
         </View>
@@ -1047,6 +1123,109 @@ export default function DashboardScreen() {
         </View>
       </Modal>
 
+      <Modal
+        visible={chatOpen}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setChatOpen(false)}
+      >
+        <View style={styles.chatModalBackdrop}>
+          <KeyboardAvoidingView
+            style={styles.keyboardAvoiding}
+            behavior={Platform.OS === "ios" ? "padding" : "height"}
+            keyboardVerticalOffset={Platform.OS === "ios" ? 12 : 0}
+          >
+            <View style={[styles.modalCard, styles.chatModalCard]}>
+              <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
+                <Text style={styles.modalTitle}>Family chat</Text>
+                <TouchableOpacity
+                  style={[styles.shareBtn, styles.refreshBtn]}
+                  onPress={async () => {
+                    try {
+                      setChatLoading(true);
+                      await loadChatMessages();
+                    } catch (e: any) {
+                      Alert.alert("Could not refresh chat", e?.message || "Try again.");
+                    } finally {
+                      setChatLoading(false);
+                    }
+                  }}
+                  disabled={chatLoading || chatSending}
+                >
+                  <Text style={[styles.shareBtnText, styles.refreshBtnText]}>
+                    {chatLoading ? "Refreshing..." : "Refresh"}
+                  </Text>
+                </TouchableOpacity>
+              </View>
+
+              <Text style={styles.mutedBottomText}>
+                Send updates and questions to everyone in your family group.
+              </Text>
+
+              <ScrollView
+                style={styles.chatScroll}
+                contentContainerStyle={styles.chatScrollContent}
+                keyboardShouldPersistTaps="handled"
+              >
+                {chatMessages.length === 0 ? (
+                  <Text style={styles.mutedText}>No messages yet. Start the conversation.</Text>
+                ) : (
+                  chatMessages.map((msg) => (
+                    <View key={msg.id} style={styles.chatRow}>
+                      <View style={styles.chatHeaderRow}>
+                        <View>
+                          <Text style={styles.chatAuthor}>
+                            {msg.userName} • {msg.userRole}
+                          </Text>
+                        </View>
+                        <Text style={styles.chatMeta}>
+                          {msg.createdAt ? new Date(msg.createdAt).toLocaleString() : ""}
+                        </Text>
+                      </View>
+                      <Text style={styles.chatBody}>{msg.message}</Text>
+                    </View>
+                  ))
+                )}
+              </ScrollView>
+
+              <TextInput
+                style={styles.chatComposerInput}
+                placeholder="Write a message..."
+                placeholderTextColor={theme.textMuted}
+                value={chatInput}
+                onChangeText={setChatInput}
+                multiline
+                editable={!chatSending}
+              />
+
+              <View style={{ flexDirection: "row", justifyContent: "flex-end", marginTop: 12 }}>
+                <TouchableOpacity
+                  style={[styles.shareBtn, styles.refreshBtn]}
+                  onPress={() => setChatOpen(false)}
+                  disabled={chatSending}
+                >
+                  <Text style={[styles.shareBtnText, styles.refreshBtnText]}>Close</Text>
+                </TouchableOpacity>
+
+                <View style={{ width: 10 }} />
+
+                <TouchableOpacity
+                  style={[styles.shareBtn, { backgroundColor: theme.primary }]}
+                  onPress={sendChatMessage}
+                  disabled={chatSending || !chatInput.trim()}
+                >
+                  {chatSending ? (
+                    <ActivityIndicator color="#fff" />
+                  ) : (
+                    <Text style={styles.shareBtnText}>Send</Text>
+                  )}
+                </TouchableOpacity>
+              </View>
+            </View>
+          </KeyboardAvoidingView>
+        </View>
+      </Modal>
+
       {/* Consent Modal */}
       <Modal
         visible={consentOpen}
@@ -1418,6 +1597,51 @@ function createStyles(theme: AppTheme) {
     mutedTopText: { color: theme.textSecondary, marginTop: 4 },
     mutedBottomText: { color: theme.textSecondary, marginBottom: 10 },
     mutedText: { color: theme.textSecondary },
+    chatScroll: { flex: 1, marginBottom: 10 },
+    chatScrollContent: { paddingBottom: 6 },
+    chatRow: {
+      backgroundColor: theme.surfaceAlt,
+      borderRadius: 14,
+      borderWidth: 1,
+      borderColor: theme.border,
+      padding: 10,
+      marginBottom: 8,
+    },
+    chatHeaderRow: {
+      flexDirection: "row",
+      justifyContent: "space-between",
+      alignItems: "flex-start",
+      gap: 8 as any,
+    },
+    chatAuthor: { fontSize: 12, fontWeight: "800", color: theme.textPrimary },
+    chatMeta: { fontSize: 11, color: theme.textMuted },
+    chatBody: { fontSize: 14, color: theme.textPrimary, marginTop: 6, lineHeight: 20 },
+    chatComposerInput: {
+      backgroundColor: theme.input,
+      borderRadius: 14,
+      paddingVertical: 12,
+      paddingHorizontal: 14,
+      fontSize: 15,
+      borderWidth: 1,
+      borderColor: theme.border,
+      color: theme.textPrimary,
+      minHeight: 52,
+      maxHeight: 120,
+      textAlignVertical: "top",
+    },
+    keyboardAvoiding: { flex: 1, width: "100%" },
+    chatModalBackdrop: {
+      flex: 1,
+      backgroundColor: theme.background,
+    },
+    chatModalCard: {
+      flex: 1,
+      borderRadius: 0,
+      borderTopLeftRadius: 0,
+      borderTopRightRadius: 0,
+      paddingTop: 56,
+      paddingBottom: 14,
+    },
 
     modalBackdrop: {
       flex: 1,

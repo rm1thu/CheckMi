@@ -5,6 +5,7 @@ import string
 import hashlib
 import hmac
 import os
+from urllib.parse import urlparse
 
 import requests
 from fastapi import FastAPI, Depends, HTTPException, Header
@@ -86,6 +87,17 @@ class FamilyGoalDB(Base):
 
     created_at = Column(DateTime, nullable=False, server_default=func.now())
     updated_at = Column(DateTime, nullable=False, server_default=func.now(), onupdate=func.now())
+
+
+class FamilyChatMessageDB(Base):
+    __tablename__ = "family_chat_messages"
+
+    id = Column(Integer, primary_key=True, index=True)
+    family_id = Column(Integer, ForeignKey("families.id"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    message = Column(String(1000), nullable=False)
+    parent_id = Column(Integer, ForeignKey("family_chat_messages.id"), nullable=True)
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
 
 
 class MetricEntryDB(Base):
@@ -180,6 +192,28 @@ class AuthTokenDB(Base):
     created_at = Column(DateTime, nullable=False, server_default=func.now())
 
 
+class AdminTokenDB(Base):
+    __tablename__ = "admin_tokens"
+
+    id = Column(Integer, primary_key=True, index=True)
+    token = Column(String(64), unique=True, nullable=False, index=True)
+    admin_username = Column(String(100), nullable=False)
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
+
+
+class DataDeletionRequestDB(Base):
+    __tablename__ = "data_deletion_requests"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, nullable=False, index=True)
+    request_type = Column(String(40), nullable=False, index=True)  # delete_data | delete_account
+    status = Column(String(20), nullable=False, default="pending", index=True)  # pending | approved | rejected
+    requested_at = Column(DateTime, nullable=False, server_default=func.now())
+    reviewed_at = Column(DateTime, nullable=True)
+    reviewed_by = Column(String(100), nullable=True)
+    review_note = Column(String(500), nullable=True)
+
+
 Base.metadata.create_all(bind=engine)
 
 
@@ -187,6 +221,13 @@ Base.metadata.create_all(bind=engine)
 
 DEFAULT_FAMILY_STEPS_GOAL = 10000
 DEFAULT_FAMILY_SLEEP_GOAL = 8.0
+
+ADMIN_FIXED_USERNAME = os.getenv("CHECKMI_ADMIN_USERNAME", "admin")
+ADMIN_FIXED_PASSWORD = os.getenv("CHECKMI_ADMIN_PASSWORD", "admin123")
+
+DELETE_REQUEST_DATA = "delete_data"
+DELETE_REQUEST_ACCOUNT = "delete_account"
+DELETE_REQUEST_ALLOWED = {DELETE_REQUEST_DATA, DELETE_REQUEST_ACCOUNT}
 
 def latest_entry_for_user(db: Session, user_id: int):
     return (
@@ -269,6 +310,142 @@ def get_current_user(
         raise HTTPException(status_code=401, detail="User not found for token")
 
     return user
+
+
+def get_current_admin(
+    db: Session = Depends(get_db),
+    authorization: Optional[str] = Header(default=None),
+) -> str:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing Bearer token")
+
+    token = authorization.split(" ", 1)[1].strip()
+    row = db.query(AdminTokenDB).filter(AdminTokenDB.token == token).first()
+    if not row:
+        raise HTTPException(status_code=401, detail="Invalid admin token")
+    return row.admin_username
+
+
+def request_label(request_type: str) -> str:
+    if request_type == DELETE_REQUEST_DATA:
+        return "delete data"
+    if request_type == DELETE_REQUEST_ACCOUNT:
+        return "delete account"
+    return request_type
+
+
+def create_or_get_pending_deletion_request(
+    db: Session,
+    user_id: int,
+    request_type: str,
+) -> DataDeletionRequestDB:
+    row = (
+        db.query(DataDeletionRequestDB)
+        .filter(
+            DataDeletionRequestDB.user_id == user_id,
+            DataDeletionRequestDB.request_type == request_type,
+            DataDeletionRequestDB.status == "pending",
+        )
+        .first()
+    )
+    if row:
+        return row
+
+    row = DataDeletionRequestDB(
+        user_id=user_id,
+        request_type=request_type,
+        status="pending",
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+def execute_delete_my_data(db: Session, user_id: int):
+    membership = db.query(FamilyMemberDB).filter(FamilyMemberDB.user_id == user_id).first()
+    family_id = membership.family_id if membership else None
+
+    db.query(MetricEntryDB).filter(MetricEntryDB.user_id == user_id).delete(synchronize_session=False)
+    db.query(AlertDB).filter(AlertDB.user_id == user_id).delete(synchronize_session=False)
+    db.query(FamilyChatMessageDB).filter(FamilyChatMessageDB.user_id == user_id).delete(synchronize_session=False)
+
+    if family_id:
+        db.query(MetricConsentDB).filter(
+            MetricConsentDB.family_id == family_id,
+            MetricConsentDB.user_id == user_id
+        ).delete(synchronize_session=False)
+
+    db.commit()
+
+
+def execute_delete_my_account(db: Session, user_id: int):
+    membership = db.query(FamilyMemberDB).filter(FamilyMemberDB.user_id == user_id).first()
+    family_id = membership.family_id if membership else None
+
+    db.query(AuthTokenDB).filter(AuthTokenDB.user_id == user_id).delete(synchronize_session=False)
+
+    db.query(MetricEntryDB).filter(MetricEntryDB.user_id == user_id).delete(synchronize_session=False)
+    db.query(AlertDB).filter(AlertDB.user_id == user_id).delete(synchronize_session=False)
+    db.query(FamilyChatMessageDB).filter(FamilyChatMessageDB.user_id == user_id).delete(synchronize_session=False)
+
+    if family_id:
+        db.query(MetricConsentDB).filter(
+            MetricConsentDB.family_id == family_id,
+            MetricConsentDB.user_id == user_id
+        ).delete(synchronize_session=False)
+
+    db.query(FamilyMemberDB).filter(
+        FamilyMemberDB.user_id == user_id
+    ).delete(synchronize_session=False)
+
+    owned_families = db.query(FamilyDB).filter(FamilyDB.owner_user_id == user_id).all()
+
+    for fam in owned_families:
+        remaining_members = (
+            db.query(FamilyMemberDB)
+            .filter(FamilyMemberDB.family_id == fam.id)
+            .all()
+        )
+
+        if len(remaining_members) == 0:
+            db.query(MetricConsentDB).filter(
+                MetricConsentDB.family_id == fam.id
+            ).delete(synchronize_session=False)
+
+            db.query(ShareCodeDB).filter(
+                ShareCodeDB.family_id == fam.id
+            ).delete(synchronize_session=False)
+
+            db.query(FamilyGoalDB).filter(
+                FamilyGoalDB.family_id == fam.id
+            ).delete(synchronize_session=False)
+
+            db.query(FamilyChatMessageDB).filter(
+                FamilyChatMessageDB.family_id == fam.id
+            ).delete(synchronize_session=False)
+
+            db.query(FamilyMemberDB).filter(
+                FamilyMemberDB.family_id == fam.id
+            ).delete(synchronize_session=False)
+
+            db.query(FamilyDB).filter(
+                FamilyDB.id == fam.id
+            ).delete(synchronize_session=False)
+        else:
+            fam.owner_user_id = remaining_members[0].user_id
+            db.add(fam)
+
+    db.flush()
+
+    db.query(AuthUserDB).filter(AuthUserDB.user_id == user_id).delete(synchronize_session=False)
+    db.query(UserDB).filter(UserDB.id == user_id).delete(synchronize_session=False)
+    db.query(DataDeletionRequestDB).filter(
+        DataDeletionRequestDB.user_id == user_id,
+        DataDeletionRequestDB.status == "pending",
+    ).update({DataDeletionRequestDB.status: "approved"}, synchronize_session=False)
+
+    db.commit()
 
 
 def create_family_for_user(db: Session, user_id: int, family_name: str = "My Family") -> FamilyDB:
@@ -383,6 +560,9 @@ def leave_family_membership(db: Session, user_id: int, family_id: int) -> None:
         db.query(FamilyGoalDB).filter(
             FamilyGoalDB.family_id == family_id
         ).delete(synchronize_session=False)
+        db.query(FamilyChatMessageDB).filter(
+            FamilyChatMessageDB.family_id == family_id
+        ).delete(synchronize_session=False)
         db.query(FamilyMemberDB).filter(
             FamilyMemberDB.family_id == family_id
         ).delete(synchronize_session=False)
@@ -405,6 +585,45 @@ def assert_same_family(db: Session, viewer_user_id: int, target_user_id: int):
     target_family = get_user_family_id(db, target_user_id)
     if not viewer_family or viewer_family != target_family:
         raise HTTPException(status_code=403, detail="Not allowed")
+
+
+def display_role_for_viewer(raw_role: Optional[str], target_user_id: int, viewer_user_id: int) -> str:
+    """
+    Keep "Self" only for the viewer's own profile.
+    For other people, fallback "Self" reads better as "Family member".
+    """
+    role = (raw_role or "").strip()
+    if not role:
+        return "Self" if target_user_id == viewer_user_id else "Family member"
+    if target_user_id != viewer_user_id and role.lower() == "self":
+        return "Family member"
+    return role
+
+
+def as_deletion_request_item(db: Session, row: DataDeletionRequestDB) -> "DeletionRequestItem":
+    u = db.query(UserDB).filter(UserDB.id == row.user_id).first()
+    auth = db.query(AuthUserDB).filter(AuthUserDB.user_id == row.user_id).first()
+
+    if u:
+        user_name = f"{u.first_name} {u.last_name}"
+        user_role = u.role or "Self"
+    else:
+        user_name = f"Deleted user #{row.user_id}"
+        user_role = "Deleted"
+
+    return DeletionRequestItem(
+        id=row.id,
+        userId=row.user_id,
+        userName=user_name,
+        userRole=user_role,
+        userEmail=auth.email if auth else None,
+        requestType=row.request_type,
+        status=row.status,
+        requestedAt=row.requested_at.isoformat() if row.requested_at else "",
+        reviewedAt=row.reviewed_at.isoformat() if row.reviewed_at else None,
+        reviewedBy=row.reviewed_by,
+        reviewNote=row.review_note,
+    )
 
 
 # -------- Consent helpers --------
@@ -636,59 +855,141 @@ def _as_text(v: Any) -> str:
     return str(v)
 
 
-def decide_livewell_slugs_from_metrics(m: Dict[str, Any]) -> List[str]:
-    wanted: List[str] = []
+LIVEWELL_SLUG_ALIASES: Dict[str, List[str]] = {
+    "exercise": ["exercise", "exercise-and-fitness", "get-active", "physical-activity"],
+    "sleep-and-tiredness": ["sleep-and-tiredness", "sleep", "insomnia", "tiredness"],
+    "healthy-eating": ["healthy-eating", "eat-well", "food-and-diet", "nutrition"],
+    "healthy-weight": ["healthy-weight", "lose-weight", "weight-management", "weight-loss"],
+}
+
+LIVEWELL_FALLBACK_BY_SLUG: Dict[str, Dict[str, str]] = {
+    "exercise": {
+        "title": "NHS exercise advice",
+        "summary": "Support your activity levels with NHS movement and fitness guidance.",
+        "url": "https://www.nhs.uk/live-well/exercise/",
+    },
+    "sleep-and-tiredness": {
+        "title": "NHS sleep advice",
+        "summary": "Improve sleep quality with NHS sleep and tiredness guidance.",
+        "url": "https://www.nhs.uk/live-well/sleep-and-tiredness/",
+    },
+    "healthy-eating": {
+        "title": "NHS healthy eating advice",
+        "summary": "Use NHS food and diet guidance to support long-term health.",
+        "url": "https://www.nhs.uk/live-well/eat-well/",
+    },
+    "healthy-weight": {
+        "title": "NHS healthy weight advice",
+        "summary": "Use NHS healthy weight guidance for practical lifestyle support.",
+        "url": "https://www.nhs.uk/live-well/healthy-weight/",
+    },
+}
+
+
+def normalize_slug(raw: str) -> str:
+    v = (raw or "").strip().lower()
+    if not v:
+        return ""
+
+    if "://" in v:
+        try:
+            p = urlparse(v).path or ""
+            v = p.strip("/").split("/")[-1].strip().lower()
+        except Exception:
+            return ""
+
+    return v.strip("/")
+
+
+def pick_topic_for_slug(by_slug: Dict[str, Dict[str, Any]], target_slug: str) -> Optional[Dict[str, Any]]:
+    candidates = LIVEWELL_SLUG_ALIASES.get(target_slug, [target_slug])
+
+    for c in candidates:
+        row = by_slug.get(normalize_slug(c))
+        if row:
+            return row
+
+    for k, row in by_slug.items():
+        for c in candidates:
+            cc = normalize_slug(c)
+            if cc and (cc in k or k in cc):
+                return row
+
+    return None
+
+
+def livewell_reasons_from_metrics(m: Dict[str, Any]) -> Dict[str, List[str]]:
+    reasons: Dict[str, List[str]] = {}
+
+    def add_reason(slug: str, reason: str):
+        if slug not in reasons:
+            reasons[slug] = []
+        if reason not in reasons[slug]:
+            reasons[slug].append(reason)
 
     steps = m.get("steps")
     if isinstance(steps, (int, float)) and steps < 5000:
-        wanted.append("exercise")
+        add_reason("exercise", f"low daily steps ({int(steps)})")
 
     sleep = m.get("sleep")
     if isinstance(sleep, (int, float)) and sleep < 7:
-        wanted.append("sleep-and-tiredness")
+        add_reason("sleep-and-tiredness", f"low sleep duration ({sleep:.1f} hours)")
 
     sys_bp = m.get("systolicBP")
     dia_bp = m.get("diastolicBP")
     if isinstance(sys_bp, (int, float)) and isinstance(dia_bp, (int, float)):
         if sys_bp >= 180 or dia_bp >= 120:
-            wanted.extend(["healthy-eating", "exercise", "healthy-weight"])
+            reason = f"very high blood pressure ({int(sys_bp)}/{int(dia_bp)} mmHg)"
+            add_reason("healthy-eating", reason)
+            add_reason("exercise", reason)
+            add_reason("healthy-weight", reason)
         elif sys_bp >= 140 or dia_bp >= 90:
-            wanted.extend(["healthy-eating", "exercise", "healthy-weight"])
+            reason = f"high blood pressure ({int(sys_bp)}/{int(dia_bp)} mmHg)"
+            add_reason("healthy-eating", reason)
+            add_reason("exercise", reason)
+            add_reason("healthy-weight", reason)
 
     cholesterol = m.get("cholesterol")
     if isinstance(cholesterol, (int, float)) and cholesterol > 5:
-        wanted.extend(["healthy-eating", "healthy-weight", "exercise"])
+        reason = f"high cholesterol ({cholesterol:.1f} mmol/L)"
+        add_reason("healthy-eating", reason)
+        add_reason("healthy-weight", reason)
+        add_reason("exercise", reason)
 
     weight = m.get("weight")
     if isinstance(weight, (int, float)) and weight >= 85:
-        wanted.append("healthy-weight")
+        add_reason("healthy-weight", f"higher weight range ({weight:.1f} kg)")
 
     bg = m.get("bloodGlucose")
     if isinstance(bg, (int, float)) and bg > 7.8:
-        wanted.extend(["healthy-eating", "exercise", "healthy-weight"])
+        reason = f"high blood glucose ({bg:.1f} mmol/L)"
+        add_reason("healthy-eating", reason)
+        add_reason("exercise", reason)
+        add_reason("healthy-weight", reason)
 
     hr = m.get("heartRate")
     if isinstance(hr, (int, float)) and hr > 100:
-        wanted.append("exercise")
+        add_reason("exercise", f"high heart rate ({int(hr)} bpm)")
 
-    seen = set()
-    deduped: List[str] = []
-    for s in wanted:
-        if s not in seen:
-            seen.add(s)
-            deduped.append(s)
-    return deduped
+    return reasons
+
+
+def decide_livewell_slugs_from_metrics(m: Dict[str, Any]) -> List[str]:
+    return list(livewell_reasons_from_metrics(m).keys())
 
 
 def build_recommendations(metrics: Dict[str, Any]) -> List[Dict[str, Any]]:
     topics = fetch_nhs_livewell_topics()
-    wanted_slugs = decide_livewell_slugs_from_metrics(metrics)
+    reasons_by_slug = livewell_reasons_from_metrics(metrics)
+    wanted_slugs = list(reasons_by_slug.keys())
 
     by_slug: Dict[str, Dict[str, Any]] = {}
     for t in topics:
         if isinstance(t, dict):
-            slug = t.get("slug")
-            if isinstance(slug, str):
+            slug = normalize_slug(_as_text(t.get("slug")))
+            if not slug:
+                slug = normalize_slug(_as_text(t.get("url")))
+            if slug:
                 by_slug[slug] = t
 
     results: List[Dict[str, Any]] = []
@@ -708,17 +1009,39 @@ def build_recommendations(metrics: Dict[str, Any]) -> List[Dict[str, Any]]:
             })
 
     for slug in wanted_slugs:
-        t = by_slug.get(slug)
-        if not t:
+        t = pick_topic_for_slug(by_slug, slug)
+        reasons = reasons_by_slug.get(slug, [])
+        reason_text = "; ".join(reasons[:3]) if reasons else ""
+
+        if t:
+            summary_base = _as_text(t.get("description")) or _as_text(t.get("summary"))
+            summary = summary_base
+            if reason_text:
+                summary = (summary_base + " " if summary_base else "") + f"Triggered by: {reason_text}."
+
+            results.append({
+                "title": _as_text(t.get("title")) or "NHS advice",
+                "summary": summary,
+                "url": _as_text(t.get("url")),
+                "slug": _as_text(slug),
+                "severity": "info",
+                "source": "NHS",
+            })
             continue
-        results.append({
-            "title": _as_text(t.get("title")) or "NHS advice",
-            "summary": _as_text(t.get("description")) or _as_text(t.get("summary")),
-            "url": _as_text(t.get("url")),
-            "slug": _as_text(slug),
-            "severity": "info",
-            "source": "NHS",
-        })
+
+        fallback = LIVEWELL_FALLBACK_BY_SLUG.get(slug)
+        if fallback:
+            summary = fallback["summary"]
+            if reason_text:
+                summary = f"{summary} Triggered by: {reason_text}."
+            results.append({
+                "title": fallback["title"],
+                "summary": summary,
+                "url": fallback["url"],
+                "slug": slug,
+                "severity": "info",
+                "source": "NHS",
+            })
 
     # Fallback if NHS is down or no matches
     if not results:
@@ -787,6 +1110,22 @@ class FamilyGoals(BaseModel):
     sleep: float
 
 
+class FamilyChatMessageCreate(BaseModel):
+    message: str
+    parentId: Optional[int] = None
+
+
+class FamilyChatMessageItem(BaseModel):
+    id: int
+    familyId: int
+    userId: int
+    userName: str
+    userRole: str
+    message: str
+    parentId: Optional[int] = None
+    createdAt: str
+
+
 class UpdateFamilyGoalsRequest(BaseModel):
     steps: Optional[int] = None
     sleep: Optional[float] = None
@@ -806,6 +1145,34 @@ class SignupRequest(BaseModel):
 
 class JoinFamilyRequest(BaseModel):
     code: str
+
+
+class AdminLoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class AdminLoginResponse(BaseModel):
+    token: str
+    username: str
+
+
+class DeletionRequestItem(BaseModel):
+    id: int
+    userId: int
+    userName: str
+    userRole: str
+    userEmail: Optional[str] = None
+    requestType: str
+    status: str
+    requestedAt: str
+    reviewedAt: Optional[str] = None
+    reviewedBy: Optional[str] = None
+    reviewNote: Optional[str] = None
+
+
+class DeletionRequestDecision(BaseModel):
+    note: Optional[str] = None
 
 
 class RecommendationItem(BaseModel):
@@ -966,6 +1333,20 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
     db.commit()
 
     return {"token": token}
+
+
+@app.post("/admin/login", response_model=AdminLoginResponse)
+def admin_login(payload: AdminLoginRequest, db: Session = Depends(get_db)):
+    username = payload.username.strip()
+    password = payload.password
+
+    if username != ADMIN_FIXED_USERNAME or password != ADMIN_FIXED_PASSWORD:
+        raise HTTPException(status_code=401, detail="Invalid admin credentials")
+
+    token = generate_token()
+    db.add(AdminTokenDB(token=token, admin_username=username))
+    db.commit()
+    return AdminLoginResponse(token=token, username=username)
 
 
 # ===================== PROTECTED ROUTES (ME) =====================
@@ -1266,25 +1647,15 @@ def delete_my_data(
     db: Session = Depends(get_db),
 ):
     """
-    Deletes the user's personal data (metrics, alerts, consent rows),
-    but keeps their account.
+    Requests deletion of personal data.
+    Request must be approved by an admin.
     """
-    # Find family membership for consent deletion
-    membership = db.query(FamilyMemberDB).filter(FamilyMemberDB.user_id == user.id).first()
-    family_id = membership.family_id if membership else None
-
-    # Delete personal content
-    db.query(MetricEntryDB).filter(MetricEntryDB.user_id == user.id).delete(synchronize_session=False)
-    db.query(AlertDB).filter(AlertDB.user_id == user.id).delete(synchronize_session=False)
-
-    if family_id:
-        db.query(MetricConsentDB).filter(
-            MetricConsentDB.family_id == family_id,
-            MetricConsentDB.user_id == user.id
-        ).delete(synchronize_session=False)
-
-    db.commit()
-    return {"detail": "All personal data deleted (account retained)."}
+    row = create_or_get_pending_deletion_request(db, user.id, DELETE_REQUEST_DATA)
+    return {
+        "detail": f"Your request to {request_label(row.request_type)} was sent to admin for approval.",
+        "requestId": row.id,
+        "status": row.status,
+    }
 
 
 @app.delete("/me")
@@ -1293,83 +1664,114 @@ def delete_my_account(
     db: Session = Depends(get_db),
 ):
     """
-    Deletes the user's account and associated data.
-    Also safely handles any families they own.
+    Requests account deletion.
+    Request must be approved by an admin.
     """
+    row = create_or_get_pending_deletion_request(db, user.id, DELETE_REQUEST_ACCOUNT)
+    return {
+        "detail": f"Your request to {request_label(row.request_type)} was sent to admin for approval.",
+        "requestId": row.id,
+        "status": row.status,
+    }
+
+
+# ===================== ADMIN ROUTES =====================
+
+@app.get("/admin/deletion-requests", response_model=List[DeletionRequestItem])
+def admin_list_deletion_requests(
+    status: str = "pending",
+    admin_username: str = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    _ = admin_username  # auth gate
+    normalized = (status or "pending").strip().lower()
+    if normalized not in {"pending", "approved", "rejected", "all"}:
+        raise HTTPException(status_code=400, detail="Invalid status filter")
+
+    q = db.query(DataDeletionRequestDB)
+    if normalized != "all":
+        q = q.filter(DataDeletionRequestDB.status == normalized)
+
+    rows = (
+        q.order_by(DataDeletionRequestDB.requested_at.desc(), DataDeletionRequestDB.id.desc())
+        .limit(300)
+        .all()
+    )
+    return [as_deletion_request_item(db, r) for r in rows]
+
+
+@app.post("/admin/deletion-requests/{request_id}/approve")
+def admin_approve_deletion_request(
+    request_id: int,
+    admin_username: str = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    row = db.query(DataDeletionRequestDB).filter(DataDeletionRequestDB.id == request_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Request not found")
+    if row.status != "pending":
+        raise HTTPException(status_code=400, detail="Only pending requests can be approved")
+
+    user_exists = db.query(UserDB.id).filter(UserDB.id == row.user_id).first() is not None
     try:
-        user_id = user.id
-
-        # Identify membership / family (may be None)
-        membership = db.query(FamilyMemberDB).filter(FamilyMemberDB.user_id == user_id).first()
-        family_id = membership.family_id if membership else None
-
-        # 1) Delete auth tokens
-        db.query(AuthTokenDB).filter(AuthTokenDB.user_id == user_id).delete(synchronize_session=False)
-
-        # 2) Delete user-owned data
-        db.query(MetricEntryDB).filter(MetricEntryDB.user_id == user_id).delete(synchronize_session=False)
-        db.query(AlertDB).filter(AlertDB.user_id == user_id).delete(synchronize_session=False)
-
-        # 3) Delete THIS user's consent rows (if we know their family)
-        if family_id:
-            db.query(MetricConsentDB).filter(
-                MetricConsentDB.family_id == family_id,
-                MetricConsentDB.user_id == user_id
-            ).delete(synchronize_session=False)
-
-        # 4) Remove membership row(s) for this user
-        db.query(FamilyMemberDB).filter(
-            FamilyMemberDB.user_id == user_id
-        ).delete(synchronize_session=False)
-
-        # 5) Handle ALL families this user owns
-        owned_families = db.query(FamilyDB).filter(FamilyDB.owner_user_id == user_id).all()
-
-        for fam in owned_families:
-            remaining_members = (
-                db.query(FamilyMemberDB)
-                .filter(FamilyMemberDB.family_id == fam.id)
-                .all()
-            )
-
-            if len(remaining_members) == 0:
-                # delete family-linked tables FIRST (FK order)
-                db.query(MetricConsentDB).filter(
-                    MetricConsentDB.family_id == fam.id
-                ).delete(synchronize_session=False)
-
-                db.query(ShareCodeDB).filter(
-                    ShareCodeDB.family_id == fam.id
-                ).delete(synchronize_session=False)
-
-                # (safe cleanup even though should be empty)
-                db.query(FamilyMemberDB).filter(
-                    FamilyMemberDB.family_id == fam.id
-                ).delete(synchronize_session=False)
-
-                # now delete the family
-                db.query(FamilyDB).filter(
-                    FamilyDB.id == fam.id
-                ).delete(synchronize_session=False)
+        if user_exists:
+            if row.request_type == DELETE_REQUEST_DATA:
+                execute_delete_my_data(db, row.user_id)
+            elif row.request_type == DELETE_REQUEST_ACCOUNT:
+                execute_delete_my_account(db, row.user_id)
             else:
-                # Transfer ownership to first remaining member
-                fam.owner_user_id = remaining_members[0].user_id
-                db.add(fam)
-
-        db.flush()
-
-        # 6) Delete auth user row
-        db.query(AuthUserDB).filter(AuthUserDB.user_id == user_id).delete(synchronize_session=False)
-
-        # 7) Delete the user
-        db.query(UserDB).filter(UserDB.id == user_id).delete(synchronize_session=False)
-
-        db.commit()
-        return {"detail": "Account and associated data deleted."}
-
+                raise HTTPException(status_code=400, detail="Unknown request type")
+    except HTTPException:
+        raise
     except Exception:
         db.rollback()
         raise
+
+    row = db.query(DataDeletionRequestDB).filter(DataDeletionRequestDB.id == request_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Request no longer exists")
+
+    row.status = "approved"
+    row.reviewed_by = admin_username
+    row.reviewed_at = datetime.utcnow()
+    if not user_exists:
+        row.review_note = "Approved: user no longer exists."
+    db.add(row)
+    db.commit()
+
+    return {
+        "detail": f"Request #{request_id} approved.",
+        "requestId": request_id,
+        "status": row.status,
+    }
+
+
+@app.post("/admin/deletion-requests/{request_id}/reject")
+def admin_reject_deletion_request(
+    request_id: int,
+    payload: DeletionRequestDecision,
+    admin_username: str = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    row = db.query(DataDeletionRequestDB).filter(DataDeletionRequestDB.id == request_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Request not found")
+    if row.status != "pending":
+        raise HTTPException(status_code=400, detail="Only pending requests can be rejected")
+
+    row.status = "rejected"
+    row.reviewed_by = admin_username
+    row.reviewed_at = datetime.utcnow()
+    note = (payload.note or "").strip()
+    row.review_note = note or "Rejected by admin"
+    db.add(row)
+    db.commit()
+
+    return {
+        "detail": f"Request #{request_id} rejected.",
+        "requestId": request_id,
+        "status": row.status,
+    }
 
 
 # ===================== CONSENT ROUTES =====================
@@ -1750,6 +2152,104 @@ def update_family_goals(
     return FamilyGoals(steps=goals.steps_goal, sleep=goals.sleep_goal)
 
 
+@app.get("/family/chat/messages", response_model=List[FamilyChatMessageItem])
+def get_family_chat_messages(
+    limit: int = 100,
+    user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    family_id = ensure_user_has_family(db, user)
+    safe_limit = max(1, min(int(limit), 200))
+
+    rows = (
+        db.query(FamilyChatMessageDB)
+        .filter(FamilyChatMessageDB.family_id == family_id)
+        .order_by(FamilyChatMessageDB.created_at.desc(), FamilyChatMessageDB.id.desc())
+        .limit(safe_limit)
+        .all()
+    )
+
+    user_ids = list({r.user_id for r in rows})
+    user_map: Dict[int, UserDB] = {}
+    if user_ids:
+        user_map = {
+            u.id: u
+            for u in db.query(UserDB).filter(UserDB.id.in_(user_ids)).all()
+        }
+
+    out_desc: List[FamilyChatMessageItem] = []
+    for r in rows:
+        author = user_map.get(r.user_id)
+        out_desc.append(
+            FamilyChatMessageItem(
+                id=r.id,
+                familyId=r.family_id,
+                userId=r.user_id,
+                userName=f"{author.first_name} {author.last_name}" if author else f"User {r.user_id}",
+                userRole=display_role_for_viewer(
+                    author.role if author else None,
+                    r.user_id,
+                    user.id,
+                ),
+                message=r.message,
+                parentId=r.parent_id,
+                createdAt=r.created_at.isoformat() if r.created_at else "",
+            )
+        )
+
+    out_desc.reverse()
+    return out_desc
+
+
+@app.post("/family/chat/messages", response_model=FamilyChatMessageItem)
+def post_family_chat_message(
+    payload: FamilyChatMessageCreate,
+    user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    family_id = ensure_user_has_family(db, user)
+    text = payload.message.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Message cannot be empty")
+    if len(text) > 1000:
+        raise HTTPException(status_code=400, detail="Message is too long (max 1000 chars)")
+
+    parent_id: Optional[int] = None
+    if payload.parentId is not None:
+        parent = (
+            db.query(FamilyChatMessageDB)
+            .filter(
+                FamilyChatMessageDB.id == payload.parentId,
+                FamilyChatMessageDB.family_id == family_id,
+            )
+            .first()
+        )
+        if not parent:
+            raise HTTPException(status_code=404, detail="Parent message not found")
+        parent_id = parent.id
+
+    row = FamilyChatMessageDB(
+        family_id=family_id,
+        user_id=user.id,
+        message=text,
+        parent_id=parent_id,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+
+    return FamilyChatMessageItem(
+        id=row.id,
+        familyId=row.family_id,
+        userId=row.user_id,
+        userName=f"{user.first_name} {user.last_name}",
+        userRole=display_role_for_viewer(user.role, user.id, user.id),
+        message=row.message,
+        parentId=row.parent_id,
+        createdAt=row.created_at.isoformat() if row.created_at else "",
+    )
+
+
 @app.get("/family", response_model=List[FamilyMemberSummary])
 def get_family(user: UserDB = Depends(get_current_user), db: Session = Depends(get_db)):
     family_id = ensure_user_has_family(db, user)
@@ -1778,7 +2278,7 @@ def get_family(user: UserDB = Depends(get_current_user), db: Session = Depends(g
             FamilyMemberSummary(
                 id=u.id,
                 name=f"{u.first_name} {u.last_name}",
-                role=u.role,
+                role=display_role_for_viewer(u.role, u.id, user.id),
                 metrics=metrics_out,
             )
         )
@@ -1819,7 +2319,7 @@ def get_family_member(
     return FamilyMemberSummary(
         id=u.id,
         name=f"{u.first_name} {u.last_name}",
-        role=u.role,
+        role=display_role_for_viewer(u.role, u.id, user.id),
         metrics=metrics_out,
     )
 
@@ -1900,7 +2400,7 @@ def get_user_summary(user_id: int, user: UserDB = Depends(get_current_user), db:
 
     return UserSummary(
         name=f"{target.first_name} {target.last_name}",
-        role=target.role,
+        role=display_role_for_viewer(target.role, target.id, user.id),
         metrics=metrics_out,
     )
 

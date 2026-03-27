@@ -1,7 +1,7 @@
 import { router } from "expo-router";
-import LottieView from "lottie-react-native";
 import React, { useEffect, useRef } from "react";
 import { Animated, StyleSheet, Text, TouchableOpacity, View } from "react-native";
+import WelcomeAnimation from "../components/WelcomeAnimation";
 
 export default function Welcome() {
   const fade = useRef(new Animated.Value(0)).current;
@@ -46,13 +46,7 @@ export default function Welcome() {
         <Text style={styles.title}>CheckMi</Text>
         <Text style={styles.subtitle}>Your family health companion</Text>
 
-        {/* Lottie Animation */}
-        <LottieView
-          source={require("../assets/animations/heartbeat.json")}
-          autoPlay
-          loop
-          style={styles.animation}
-        />
+        <WelcomeAnimation style={styles.animation} />
 
         <Text style={styles.description}>
           Track health metrics, monitor trends, and support your family’s wellbeing — all in one place.

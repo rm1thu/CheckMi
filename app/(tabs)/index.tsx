@@ -41,6 +41,19 @@ type Metrics = {
   cholesterol: number; // mmol/L
 };
 
+type MetricFieldKey = keyof Metrics;
+
+type MetricInputState = Record<MetricFieldKey, string>;
+
+type MetricFieldConfig = {
+  key: MetricFieldKey;
+  label: string;
+  keyboardType: "decimal-pad" | "number-pad";
+  min: number;
+  max: number;
+  integer?: boolean;
+};
+
 type UserSummary = {
   name: string;
   role: string;
@@ -104,7 +117,124 @@ const TABS = [
   "Preventative Care",
 ];
 
+const METRIC_FIELDS: MetricFieldConfig[] = [
+  { key: "heartRate", label: "Heart Rate (bpm)", keyboardType: "number-pad", min: 30, max: 240, integer: true },
+  { key: "weight", label: "Weight (kg)", keyboardType: "decimal-pad", min: 1, max: 500 },
+  { key: "steps", label: "Steps", keyboardType: "number-pad", min: 0, max: 100000, integer: true },
+  { key: "sleep", label: "Sleep (hrs)", keyboardType: "decimal-pad", min: 0, max: 24 },
+  { key: "bloodGlucose", label: "Blood Glucose (mmol/L)", keyboardType: "decimal-pad", min: 0.1, max: 40 },
+  { key: "systolicBP", label: "Systolic BP (mmHg)", keyboardType: "number-pad", min: 50, max: 260, integer: true },
+  { key: "diastolicBP", label: "Diastolic BP (mmHg)", keyboardType: "number-pad", min: 30, max: 180, integer: true },
+  { key: "cholesterol", label: "Cholesterol (mmol/L)", keyboardType: "decimal-pad", min: 0.1, max: 20 },
+];
+
+const EMPTY_METRIC_INPUTS: MetricInputState = {
+  heartRate: "",
+  weight: "",
+  steps: "",
+  sleep: "",
+  bloodGlucose: "",
+  systolicBP: "",
+  diastolicBP: "",
+  cholesterol: "",
+};
+
+const ALL_METRIC_FIELDS_TOUCHED: Record<MetricFieldKey, boolean> = {
+  heartRate: true,
+  weight: true,
+  steps: true,
+  sleep: true,
+  bloodGlucose: true,
+  systolicBP: true,
+  diastolicBP: true,
+  cholesterol: true,
+};
+
+const INITIAL_METRIC_TOUCHED: Record<MetricFieldKey, boolean> = {
+  heartRate: false,
+  weight: false,
+  steps: false,
+  sleep: false,
+  bloodGlucose: false,
+  systolicBP: false,
+  diastolicBP: false,
+  cholesterol: false,
+};
+
 const BASE_URL = getApiBaseUrl();
+
+function formatMetricRangeValue(value: number): string {
+  return Number.isInteger(value) ? String(value) : value.toFixed(1);
+}
+
+function metricInputsFromMetrics(metrics?: Partial<Metrics> | null): MetricInputState {
+  return {
+    heartRate:
+      metrics?.heartRate === undefined || metrics.heartRate === null
+        ? ""
+        : String(metrics.heartRate),
+    weight:
+      metrics?.weight === undefined || metrics.weight === null ? "" : String(metrics.weight),
+    steps: metrics?.steps === undefined || metrics.steps === null ? "" : String(metrics.steps),
+    sleep: metrics?.sleep === undefined || metrics.sleep === null ? "" : String(metrics.sleep),
+    bloodGlucose:
+      metrics?.bloodGlucose === undefined || metrics.bloodGlucose === null
+        ? ""
+        : String(metrics.bloodGlucose),
+    systolicBP:
+      metrics?.systolicBP === undefined || metrics.systolicBP === null
+        ? ""
+        : String(metrics.systolicBP),
+    diastolicBP:
+      metrics?.diastolicBP === undefined || metrics.diastolicBP === null
+        ? ""
+        : String(metrics.diastolicBP),
+    cholesterol:
+      metrics?.cholesterol === undefined || metrics.cholesterol === null
+        ? ""
+        : String(metrics.cholesterol),
+  };
+}
+
+function validateMetricInputs(inputs: MetricInputState): {
+  errors: Partial<Record<MetricFieldKey, string>>;
+  payload: Metrics | null;
+} {
+  const errors: Partial<Record<MetricFieldKey, string>> = {};
+  const parsed = {} as Metrics;
+
+  for (const field of METRIC_FIELDS) {
+    const raw = inputs[field.key].trim();
+
+    if (!raw) {
+      errors[field.key] = `${field.label} is required.`;
+      continue;
+    }
+
+    const number = Number(raw.replace(/,/g, ""));
+    if (!Number.isFinite(number)) {
+      errors[field.key] = `Enter a valid ${field.integer ? "whole " : ""}number for ${field.label.toLowerCase()}.`;
+      continue;
+    }
+
+    if (field.integer && !Number.isInteger(number)) {
+      errors[field.key] = `${field.label} must be a whole number.`;
+      continue;
+    }
+
+    if (number < field.min || number > field.max) {
+      errors[field.key] = `${field.label} must be between ${formatMetricRangeValue(field.min)} and ${formatMetricRangeValue(field.max)}.`;
+      continue;
+    }
+
+    parsed[field.key] = field.integer ? Math.trunc(number) : number;
+  }
+
+  return {
+    errors,
+    payload: Object.keys(errors).length === 0 ? parsed : null,
+  };
+}
 
 async function authFetch(url: string, options: RequestInit = {}) {
   const token = await SecureStore.getItemAsync("token");
@@ -152,16 +282,20 @@ export default function HomeScreen() {
   });
 
   const [modalVisible, setModalVisible] = useState(false);
-  const [heartRateInput, setHeartRateInput] = useState("");
-  const [weightInput, setWeightInput] = useState("");
-  const [stepsInput, setStepsInput] = useState("");
-  const [sleepInput, setSleepInput] = useState("");
-  const [bloodGlucoseInput, setBloodGlucoseInput] = useState("");
-  const [systolicBPInput, setSystolicBPInput] = useState("");
-  const [diastolicBPInput, setDiastolicBPInput] = useState("");
-  const [cholesterolInput, setCholesterolInput] = useState("");
+  const [metricInputs, setMetricInputs] = useState<MetricInputState>(EMPTY_METRIC_INPUTS);
+  const [metricTouched, setMetricTouched] = useState<Record<MetricFieldKey, boolean>>(
+    INITIAL_METRIC_TOUCHED
+  );
+  const [metricSubmitAttempted, setMetricSubmitAttempted] = useState(false);
   const [saving, setSaving] = useState(false);
   const [magnifiedCardsEnabled, setMagnifiedCardsEnabled] = useState(false);
+
+  const metricValidation = React.useMemo(
+    () => validateMetricInputs(metricInputs),
+    [metricInputs]
+  );
+  const metricErrorCount = Object.keys(metricValidation.errors).length;
+  const canSaveMetrics = metricErrorCount === 0;
 
   const formatSteps = (steps: number | undefined) => {
     if (steps === undefined || steps === null) return "--";
@@ -228,6 +362,7 @@ export default function HomeScreen() {
 
       if (res.status === 404) {
         setSummary(null);
+        setMetricInputs(EMPTY_METRIC_INPUTS);
         return;
       }
 
@@ -240,15 +375,7 @@ export default function HomeScreen() {
       if (data?.name) setProfileName(data.name);
       if (data?.role) setProfileRole(data.role);
 
-      const m = data.metrics;
-      setHeartRateInput(String(m.heartRate ?? ""));
-      setWeightInput(String(m.weight ?? ""));
-      setStepsInput(String(m.steps ?? ""));
-      setSleepInput(String(m.sleep ?? ""));
-      setBloodGlucoseInput(String(m.bloodGlucose ?? ""));
-      setSystolicBPInput(String(m.systolicBP ?? ""));
-      setDiastolicBPInput(String(m.diastolicBP ?? ""));
-      setCholesterolInput(String(m.cholesterol ?? ""));
+      setMetricInputs(metricInputsFromMetrics(data.metrics));
     } catch (err: any) {
       console.error(err);
       Alert.alert("Error", "Could not load your health data.");
@@ -362,31 +489,27 @@ export default function HomeScreen() {
   }, [isFocused]);
 
   const openLogHealthModal = () => {
-    if (summary) {
-      const m = summary.metrics;
-      setHeartRateInput(String(m.heartRate));
-      setWeightInput(String(m.weight));
-      setStepsInput(String(m.steps));
-      setSleepInput(String(m.sleep));
-      setBloodGlucoseInput(String(m.bloodGlucose));
-      setSystolicBPInput(String(m.systolicBP));
-      setDiastolicBPInput(String(m.diastolicBP));
-      setCholesterolInput(String(m.cholesterol));
-    }
+    setMetricInputs(metricInputsFromMetrics(summary?.metrics));
+    setMetricTouched(INITIAL_METRIC_TOUCHED);
+    setMetricSubmitAttempted(false);
     setModalVisible(true);
   };
 
+  const updateMetricInput = (key: MetricFieldKey, value: string) => {
+    setMetricInputs((current) => ({ ...current, [key]: value }));
+  };
+
+  const markMetricTouched = (key: MetricFieldKey) => {
+    setMetricTouched((current) => ({ ...current, [key]: true }));
+  };
+
   const saveHealthData = async () => {
-    const payload: Metrics = {
-      heartRate: Number(heartRateInput),
-      weight: Number(weightInput),
-      steps: Number(stepsInput),
-      sleep: Number(sleepInput),
-      bloodGlucose: Number(bloodGlucoseInput),
-      systolicBP: Number(systolicBPInput),
-      diastolicBP: Number(diastolicBPInput),
-      cholesterol: Number(cholesterolInput),
-    };
+    setMetricSubmitAttempted(true);
+    setMetricTouched(ALL_METRIC_FIELDS_TOUCHED);
+
+    if (!metricValidation.payload) return;
+
+    const payload = metricValidation.payload;
 
     try {
       setSaving(true);
@@ -415,6 +538,9 @@ export default function HomeScreen() {
 
       const updated: UserSummary = await res.json();
       setSummary(updated);
+      setMetricInputs(metricInputsFromMetrics(updated.metrics));
+      setMetricTouched(INITIAL_METRIC_TOUCHED);
+      setMetricSubmitAttempted(false);
 
       // refresh name/role just in case
       if (updated?.name) setProfileName(updated.name);
@@ -573,7 +699,13 @@ export default function HomeScreen() {
               <TouchableOpacity
                 key={tab}
                 style={[styles.tabChip, active && styles.tabChipActive]}
-                onPress={() => setActiveTab(tab)}
+                onPress={() => {
+                  if (tab === "Medications") {
+                    router.push("/medications" as any);
+                    return;
+                  }
+                  setActiveTab(tab);
+                }}
               >
                 <Text style={[styles.tabText, active && styles.tabTextActive]}>
                   {tab}
@@ -618,77 +750,35 @@ export default function HomeScreen() {
               >
                 <Text style={styles.modalTitle}>Log Health Data</Text>
 
-                <Text style={styles.modalLabel}>Heart Rate (bpm)</Text>
-                <TextInput
-                  style={styles.input}
-                  keyboardType="numeric"
-                  value={heartRateInput}
-                  onChangeText={setHeartRateInput}
-                  returnKeyType="next"
-                />
+                {metricSubmitAttempted && metricErrorCount > 0 ? (
+                  <Text style={styles.modalErrorText}>
+                    Please fix the highlighted fields before saving.
+                  </Text>
+                ) : null}
 
-                <Text style={styles.modalLabel}>Weight (kg)</Text>
-                <TextInput
-                  style={styles.input}
-                  keyboardType="numeric"
-                  value={weightInput}
-                  onChangeText={setWeightInput}
-                  returnKeyType="next"
-                />
+                {METRIC_FIELDS.map((field, index) => {
+                  const error =
+                    metricTouched[field.key] || metricSubmitAttempted
+                      ? metricValidation.errors[field.key]
+                      : undefined;
 
-                <Text style={styles.modalLabel}>Steps</Text>
-                <TextInput
-                  style={styles.input}
-                  keyboardType="numeric"
-                  value={stepsInput}
-                  onChangeText={setStepsInput}
-                  returnKeyType="next"
-                />
-
-                <Text style={styles.modalLabel}>Sleep (hrs)</Text>
-                <TextInput
-                  style={styles.input}
-                  keyboardType="numeric"
-                  value={sleepInput}
-                  onChangeText={setSleepInput}
-                  returnKeyType="next"
-                />
-
-                <Text style={styles.modalLabel}>Blood Glucose (mmol/L)</Text>
-                <TextInput
-                  style={styles.input}
-                  keyboardType="numeric"
-                  value={bloodGlucoseInput}
-                  onChangeText={setBloodGlucoseInput}
-                  returnKeyType="next"
-                />
-
-                <Text style={styles.modalLabel}>Systolic BP (mmHg)</Text>
-                <TextInput
-                  style={styles.input}
-                  keyboardType="numeric"
-                  value={systolicBPInput}
-                  onChangeText={setSystolicBPInput}
-                  returnKeyType="next"
-                />
-
-                <Text style={styles.modalLabel}>Diastolic BP (mmHg)</Text>
-                <TextInput
-                  style={styles.input}
-                  keyboardType="numeric"
-                  value={diastolicBPInput}
-                  onChangeText={setDiastolicBPInput}
-                  returnKeyType="next"
-                />
-
-                <Text style={styles.modalLabel}>Cholesterol (mmol/L)</Text>
-                <TextInput
-                  style={styles.input}
-                  keyboardType="numeric"
-                  value={cholesterolInput}
-                  onChangeText={setCholesterolInput}
-                  returnKeyType="done"
-                />
+                  return (
+                    <View key={field.key}>
+                      <Text style={styles.modalLabel}>{field.label}</Text>
+                      <TextInput
+                        style={[styles.input, error && styles.inputError]}
+                        keyboardType={field.keyboardType}
+                        value={metricInputs[field.key]}
+                        onChangeText={(value) => updateMetricInput(field.key, value)}
+                        onBlur={() => markMetricTouched(field.key)}
+                        returnKeyType={index === METRIC_FIELDS.length - 1 ? "done" : "next"}
+                        autoCapitalize="none"
+                        editable={!saving}
+                      />
+                      {error ? <Text style={styles.inputHelpText}>{error}</Text> : null}
+                    </View>
+                  );
+                })}
 
                 <View style={styles.modalButtonsRow}>
                   <TouchableOpacity
@@ -699,7 +789,11 @@ export default function HomeScreen() {
                     <Text style={styles.modalCancelText}>Cancel</Text>
                   </TouchableOpacity>
                   <TouchableOpacity
-                    style={[styles.modalButton, styles.modalSave]}
+                    style={[
+                      styles.modalButton,
+                      styles.modalSave,
+                      (!canSaveMetrics || saving) && styles.modalButtonDisabled,
+                    ]}
                     onPress={saveHealthData}
                     disabled={saving}
                   >
@@ -1634,6 +1728,14 @@ function createStyles(theme: AppTheme) {
       backgroundColor: theme.input,
       color: theme.textPrimary,
     },
+    inputError: {
+      borderColor: theme.danger,
+    },
+    inputHelpText: {
+      color: theme.danger,
+      fontSize: 12,
+      marginTop: 4,
+    },
     modalButtonsRow: { flexDirection: "row", justifyContent: "flex-end", marginTop: 16 },
     modalButton: {
       paddingHorizontal: 18,
@@ -1641,10 +1743,19 @@ function createStyles(theme: AppTheme) {
       borderRadius: 999,
       marginLeft: 8,
     },
+    modalButtonDisabled: {
+      opacity: 0.55,
+    },
     modalCancel: { backgroundColor: theme.surfaceAlt },
     modalSave: { backgroundColor: theme.primaryStrong },
     modalCancelText: { color: theme.textSecondary, fontWeight: "500" },
     modalSaveText: { color: theme.primaryText, fontWeight: "600" },
+    modalErrorText: {
+      color: theme.danger,
+      marginBottom: 8,
+      fontSize: 13,
+      fontWeight: "600",
+    },
 
     detailList: {
       marginTop: 8,

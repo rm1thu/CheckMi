@@ -13,6 +13,7 @@ import {
 } from "react-native";
 import { getApiBaseUrl } from "../../src/api";
 import { saveToken } from "../../src/auth";
+import { queueTabToast } from "../../src/tab-toast";
 
 const BASE_URL = getApiBaseUrl();
 
@@ -53,6 +54,10 @@ export default function LoginScreen() {
       }
 
       await saveToken(data.token);
+      await queueTabToast({
+        title: "Login successful",
+        message: "You have logged in successfully.",
+      });
       router.replace("/(tabs)");
     } catch {
       Alert.alert("Network error", "Could not reach the backend.");

@@ -1,50 +1,113 @@
-# Welcome to your Expo app 👋
+# CheckMi
 
-This is an [Expo](https://expo.dev) project created with [`create-expo-app`](https://www.npmjs.com/package/create-expo-app).
+CheckMi is a mobile health monitoring app built with Expo React Native and a FastAPI backend. It helps users track everyday health metrics, share selected information with family members, receive NHS-based guidance, manage medications, and request data actions through an admin approval workflow.
 
-## Get started
+## What the app does
 
-1. Install dependencies
+- Tracks core health metrics: heart rate, weight, steps, sleep, blood glucose, blood pressure, and cholesterol
+- Supports family groups with invite/share codes, role labels, member snapshots, and shared family goals
+- Provides recommendations and preventive care guidance using NHS-linked content
+- Includes a medication adherence tracker with schedules, refill warnings, and taken/missed logs
+- Offers alerts, consent-based metric sharing, PDF data export, and admin-reviewed deletion requests
+- Supports light mode, dark mode, and magnified cards for accessibility
 
-   ```bash
-   npm install
-   ```
+## Main screens
 
-2. Start the app
+- `Welcome`, `Login`, `Signup`
+- `Home` for personal metrics, recommendations, preventive care, goals, and quick actions
+- `Dashboard` for family overview, family member snapshots, goals, and family chat/forum
+- `Settings` for profile, theme, accessibility, export, privacy, and account/data actions
+- `Medications` for medication schedules and adherence
+- `Admin` for overview, user management, family monitoring, alerts, and request approvals
 
-   ```bash
-   npx expo start
-   ```
+## Tech stack
 
-In the output, you'll find options to open the app in a
+- Frontend: Expo, React Native, TypeScript, Expo Router
+- Backend: FastAPI, SQLAlchemy, Pydantic
+- Database: MySQL
+- Local storage: `expo-secure-store`
+- Device/document features: Expo FileSystem, Sharing, Linking
+- External integration: NHS Live Well API content
 
-- [development build](https://docs.expo.dev/develop/development-builds/introduction/)
-- [Android emulator](https://docs.expo.dev/workflow/android-studio-emulator/)
-- [iOS simulator](https://docs.expo.dev/workflow/ios-simulator/)
-- [Expo Go](https://expo.dev/go), a limited sandbox for trying out app development with Expo
+## Project structure
 
-You can start developing by editing the files inside the **app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
-
-## Get a fresh project
-
-When you're ready, run:
-
-```bash
-npm run reset-project
+```text
+app/                 Expo Router screens
+components/          shared UI components
+src/                 auth, API, theme, preferences, avatar helpers
+server/main.py       FastAPI app, models, helpers, endpoints
+docs/                project documentation for report/write-up use
 ```
 
-This command will move the starter code to the **app-example** directory and create a blank **app** directory where you can start developing.
+## Run locally
 
-## Learn more
+### 1. Install dependencies
 
-To learn more about developing your project with Expo, look at the following resources:
+```bash
+npm install
+```
 
-- [Expo documentation](https://docs.expo.dev/): Learn fundamentals, or go into advanced topics with our [guides](https://docs.expo.dev/guides).
-- [Learn Expo tutorial](https://docs.expo.dev/tutorial/introduction/): Follow a step-by-step tutorial where you'll create a project that runs on Android, iOS, and the web.
+### 2. Start the backend
 
-## Join the community
+The backend is defined in `server/main.py` and currently expects a local MySQL database called `CheckMi`.
 
-Join our community of developers creating universal apps.
+Important current backend configuration:
 
-- [Expo on GitHub](https://github.com/expo/expo): View our open source platform and contribute.
-- [Discord community](https://chat.expo.dev): Chat with Expo users and ask questions.
+- Database URL is set in code as `mysql+pymysql://root:@localhost:3306/CheckMi`
+- Admin login defaults:
+  - username: `admin`
+  - password: `admin123`
+- These admin credentials can be overridden with:
+  - `CHECKMI_ADMIN_USERNAME`
+  - `CHECKMI_ADMIN_PASSWORD`
+- NHS recommendations require `NHS_API_KEY`
+
+Example backend run command:
+
+```bash
+uvicorn server.main:app --reload
+```
+
+### 3. Start the Expo app
+
+The package scripts already force `TMPDIR=/tmp`, which helps avoid Metro cache permission problems on macOS.
+
+```bash
+npm run start
+```
+
+You can also use:
+
+```bash
+npm run ios
+npm run android
+npm run web
+```
+
+## Useful documentation
+
+- Full project documentation: [docs/PROJECT_DOCUMENTATION.md](/Users/mithu/CheckMi/docs/PROJECT_DOCUMENTATION.md)
+- White-box and black-box testing plan: [docs/TESTING_PLAN.md](/Users/mithu/CheckMi/docs/TESTING_PLAN.md)
+
+## Validation commands
+
+```bash
+npx tsc --noEmit
+npm run lint
+python3 -m py_compile server/main.py
+```
+
+## Current implementation notes
+
+- The backend creates tables automatically with SQLAlchemy on startup
+- Theme preference and accessibility preferences are stored locally with SecureStore
+- Data export is generated as a readable PDF on the frontend using the backend export payload
+- Account deletion and data deletion are request-based and require admin approval
+- NHS-based recommendations fall back to generic guidance if the live service is unavailable
+
+## Known limitations
+
+- The database URL is hardcoded and should be moved fully to environment variables
+- Authentication uses custom token tables rather than a more complete auth provider
+- NHS recommendation coverage depends on available mappings and NHS API availability
+- The backend is currently implemented in a single `main.py`, which works for a project build but is not ideal for long-term maintainability

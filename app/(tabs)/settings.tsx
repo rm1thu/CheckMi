@@ -618,6 +618,7 @@ export default function SettingsScreen() {
           </View>
           <Ionicons name="chevron-forward" size={18} color={theme.textMuted} />
         </TouchableOpacity>
+
       </View>
 
       <View style={styles.section}>

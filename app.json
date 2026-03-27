@@ -7,19 +7,17 @@
     "icon": "./assets/images/icon.png",
     "scheme": "checkmi",
     "userInterfaceStyle": "automatic",
-    "newArchEnabled": true,
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.anonymous.CheckMi"
+      "bundleIdentifier": "com.rm1thu.checkmi"
     },
     "android": {
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
         "foregroundImage": "./assets/images/icon.png"
       },
-      "edgeToEdgeEnabled": true,
       "predictiveBackGestureEnabled": false,
-      "package": "com.anonymous.CheckMi"
+      "package": "com.rm1thu.checkmi"
     },
     "web": {
       "output": "static",
@@ -45,6 +43,12 @@
     "experiments": {
       "typedRoutes": true,
       "reactCompiler": true
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "93278a68-aa22-4c0f-8d38-79c55d07a4b5"
+      }
     }
   }
 }

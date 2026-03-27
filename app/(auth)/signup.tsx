@@ -15,6 +15,9 @@ import { getApiBaseUrl } from "../../src/api";
 import { saveToken } from "../../src/auth";
 
 const BASE_URL = getApiBaseUrl();
+const MAX_NAME_LENGTH = 100;
+const MAX_EMAIL_LENGTH = 255;
+const MAX_PASSWORD_LENGTH = 128;
 
 const isValidEmail = (email: string) =>
   /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim());
@@ -133,6 +136,7 @@ export default function SignupScreen() {
             value={firstName}
             onChangeText={setFirstName}
             onBlur={() => setTouched((t) => ({ ...t, first: true }))}
+            maxLength={MAX_NAME_LENGTH}
             returnKeyType="next"
             onSubmitEditing={() => lastRef.current?.focus()}
             placeholder="First Name"
@@ -149,6 +153,7 @@ export default function SignupScreen() {
             value={lastName}
             onChangeText={setLastName}
             onBlur={() => setTouched((t) => ({ ...t, last: true }))}
+            maxLength={MAX_NAME_LENGTH}
             returnKeyType="next"
             onSubmitEditing={() => emailRef.current?.focus()}
             placeholder="Last Name"
@@ -169,6 +174,7 @@ export default function SignupScreen() {
             placeholderTextColor={styles._ph.color}
             keyboardType="email-address"
             autoCapitalize="none"
+            maxLength={MAX_EMAIL_LENGTH}
             returnKeyType="next"
             onSubmitEditing={() => pwRef.current?.focus()}
           />
@@ -192,6 +198,7 @@ export default function SignupScreen() {
               placeholderTextColor={styles._ph.color}
               secureTextEntry={!showPw}
               autoCapitalize="none"
+              maxLength={MAX_PASSWORD_LENGTH}
               returnKeyType="done"
               onSubmitEditing={onSignup}
             />

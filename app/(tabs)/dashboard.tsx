@@ -20,6 +20,7 @@ import {
 import { getApiBaseUrl } from "../../src/api";
 import { getAvatarPaletteForKey, getNameInitials } from "../../src/avatar";
 import { loadAppPrefs } from "../../src/prefs";
+import { showTabToast } from "../../src/tab-toast";
 import { AppTheme, useAppTheme } from "../../src/theme-mode";
 
 type Metrics = {
@@ -82,6 +83,41 @@ type FamilyChatMessage = {
 };
 
 const BASE_URL = getApiBaseUrl();
+const FAMILY_CHAT_MESSAGE_MAX = 500;
+const FAMILY_STEPS_GOAL_MAX = 100000;
+const FAMILY_SLEEP_GOAL_MIN = 1;
+const FAMILY_SLEEP_GOAL_MAX = 24;
+const FAMILY_ALERT_CATEGORY = "family";
+const LAST_SEEN_FAMILY_ALERT_ID_KEY = "last_seen_family_alert_id";
+
+function normalizeChatMessage(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function hasMeaningfulChatText(value: string): boolean {
+  return /[\p{L}\p{N}]/u.test(value);
+}
+
+function getChatMessageError(value: string): string | null {
+  const message = normalizeChatMessage(value);
+  if (!message) return "Please enter a message before sending.";
+  if (message.length > FAMILY_CHAT_MESSAGE_MAX) {
+    return `Messages must be ${FAMILY_CHAT_MESSAGE_MAX} characters or fewer.`;
+  }
+  if (!hasMeaningfulChatText(message)) {
+    return "Message must include letters or numbers.";
+  }
+  return null;
+}
+
+function getLatestUnreadFamilyAlert(alerts: AlertItem[]): AlertItem | null {
+  return (
+    alerts.find(
+      (alert) =>
+        alert.category === FAMILY_ALERT_CATEGORY && (alert?.is_read ?? 0) === 0
+    ) || null
+  );
+}
 
 async function authFetch(url: string, options: RequestInit = {}) {
   const token = await SecureStore.getItemAsync("token");
@@ -194,6 +230,8 @@ export default function DashboardScreen() {
   const [chatLoading, setChatLoading] = useState(false);
   const [chatSending, setChatSending] = useState(false);
   const [chatInput, setChatInput] = useState("");
+  const [chatTouched, setChatTouched] = useState(false);
+  const [chatSubmitAttempted, setChatSubmitAttempted] = useState(false);
   const [chatMessages, setChatMessages] = useState<FamilyChatMessage[]>([]);
 
   const [goals, setGoals] = useState<FamilyGoals>({ steps: 10000, sleep: 8 });
@@ -203,6 +241,7 @@ export default function DashboardScreen() {
   const [stepsGoalInput, setStepsGoalInput] = useState("10000");
   const [sleepGoalInput, setSleepGoalInput] = useState("8");
   const [magnifiedCardsEnabled, setMagnifiedCardsEnabled] = useState(false);
+  const chatValidationError = useMemo(() => getChatMessageError(chatInput), [chatInput]);
 
   const loadMagnificationPreference = async () => {
     try {
@@ -265,7 +304,23 @@ export default function DashboardScreen() {
     const res = await authFetch(`${BASE_URL}/me/alerts`);
     if (!res.ok) throw new Error(`Failed to load alerts: ${res.status}`);
     const data: AlertItem[] = await res.json();
-    setAlerts(Array.isArray(data) ? data : []);
+    const nextAlerts = Array.isArray(data) ? data : [];
+    setAlerts(nextAlerts);
+
+    const latestFamilyAlert = getLatestUnreadFamilyAlert(nextAlerts);
+    if (!latestFamilyAlert) return;
+
+    const lastSeenId = await SecureStore.getItemAsync(LAST_SEEN_FAMILY_ALERT_ID_KEY);
+    if (lastSeenId === String(latestFamilyAlert.id)) return;
+
+    await SecureStore.setItemAsync(
+      LAST_SEEN_FAMILY_ALERT_ID_KEY,
+      String(latestFamilyAlert.id)
+    );
+    showTabToast({
+      title: latestFamilyAlert.title,
+      message: latestFamilyAlert.message,
+    });
   };
 
   const loadChatMessages = async () => {
@@ -298,15 +353,32 @@ export default function DashboardScreen() {
   };
 
   const saveFamilyGoals = async () => {
-    const steps = Number(stepsGoalInput);
-    const sleep = Number(sleepGoalInput);
+    const stepsRaw = stepsGoalInput.trim();
+    const sleepRaw = sleepGoalInput.trim();
+    const steps = Number(stepsRaw);
+    const sleep = Number(sleepRaw);
 
-    if (!Number.isFinite(steps) || steps <= 0) {
-      Alert.alert("Invalid steps goal", "Steps goal must be a positive number.");
+    if (!stepsRaw || !Number.isInteger(steps) || steps <= 0) {
+      Alert.alert("Invalid steps goal", "Steps goal must be a whole number greater than 0.");
       return;
     }
-    if (!Number.isFinite(sleep) || sleep <= 0 || sleep > 24) {
-      Alert.alert("Invalid sleep goal", "Sleep goal must be between 0 and 24.");
+    if (steps > FAMILY_STEPS_GOAL_MAX) {
+      Alert.alert(
+        "Invalid steps goal",
+        `Steps goal must be ${FAMILY_STEPS_GOAL_MAX.toLocaleString()} or less.`
+      );
+      return;
+    }
+    if (
+      !sleepRaw ||
+      !Number.isFinite(sleep) ||
+      sleep < FAMILY_SLEEP_GOAL_MIN ||
+      sleep > FAMILY_SLEEP_GOAL_MAX
+    ) {
+      Alert.alert(
+        "Invalid sleep goal",
+        `Sleep goal must be between ${FAMILY_SLEEP_GOAL_MIN} and ${FAMILY_SLEEP_GOAL_MAX} hours.`
+      );
       return;
     }
 
@@ -414,6 +486,8 @@ export default function DashboardScreen() {
   const openChatModal = async () => {
     try {
       setChatLoading(true);
+      setChatTouched(false);
+      setChatSubmitAttempted(false);
       await loadChatMessages();
       setChatOpen(true);
     } catch (err: any) {
@@ -424,8 +498,11 @@ export default function DashboardScreen() {
   };
 
   const sendChatMessage = async () => {
-    const message = chatInput.trim();
-    if (!message) return;
+    setChatTouched(true);
+    setChatSubmitAttempted(true);
+
+    const message = normalizeChatMessage(chatInput);
+    if (chatValidationError) return;
 
     try {
       setChatSending(true);
@@ -443,6 +520,8 @@ export default function DashboardScreen() {
 
       setChatMessages((prev) => [...prev, data as FamilyChatMessage]);
       setChatInput("");
+      setChatTouched(false);
+      setChatSubmitAttempted(false);
     } catch (err: any) {
       Alert.alert("Could not send message", err?.message || "Try again.");
     } finally {
@@ -474,9 +553,16 @@ export default function DashboardScreen() {
         return;
       }
 
+      const alreadyInFamily = data?.message === "Already in this family";
       setJoinOpen(false);
       setJoinCode("");
       await refreshAll();
+      showTabToast({
+        title: alreadyInFamily ? "Already in family" : "Joined family",
+        message: alreadyInFamily
+          ? "You are already a member of this family group."
+          : "You have joined the family group.",
+      });
     } catch (err: any) {
       console.error("❌ Join error:", err);
       Alert.alert("Join failed", err?.message || "Could not join family");
@@ -1085,7 +1171,8 @@ export default function DashboardScreen() {
               style={styles.modalInput}
               keyboardType="numeric"
               value={stepsGoalInput}
-              onChangeText={setStepsGoalInput}
+              onChangeText={(value) => setStepsGoalInput(value.replace(/[^\d]/g, ""))}
+              maxLength={6}
             />
 
             <Text style={styles.goalInputLabel}>Sleep goal (hours)</Text>
@@ -1093,7 +1180,12 @@ export default function DashboardScreen() {
               style={styles.modalInput}
               keyboardType="decimal-pad"
               value={sleepGoalInput}
-              onChangeText={setSleepGoalInput}
+              onChangeText={(value) => {
+                const cleaned = value.replace(/[^0-9.]/g, "");
+                const [whole, ...rest] = cleaned.split(".");
+                setSleepGoalInput(rest.length ? `${whole}.${rest.join("")}` : cleaned);
+              }}
+              maxLength={5}
             />
 
             <View style={{ flexDirection: "row", justifyContent: "flex-end", marginTop: 14 }}>
@@ -1127,7 +1219,11 @@ export default function DashboardScreen() {
         visible={chatOpen}
         transparent
         animationType="slide"
-        onRequestClose={() => setChatOpen(false)}
+        onRequestClose={() => {
+          setChatOpen(false);
+          setChatTouched(false);
+          setChatSubmitAttempted(false);
+        }}
       >
         <View style={styles.chatModalBackdrop}>
           <KeyboardAvoidingView
@@ -1189,19 +1285,33 @@ export default function DashboardScreen() {
               </ScrollView>
 
               <TextInput
-                style={styles.chatComposerInput}
+                style={[
+                  styles.chatComposerInput,
+                  (chatTouched || chatSubmitAttempted) &&
+                    chatValidationError &&
+                    styles.chatComposerInputError,
+                ]}
                 placeholder="Write a message..."
                 placeholderTextColor={theme.textMuted}
                 value={chatInput}
                 onChangeText={setChatInput}
+                onBlur={() => setChatTouched(true)}
+                maxLength={FAMILY_CHAT_MESSAGE_MAX}
                 multiline
                 editable={!chatSending}
               />
+              {(chatTouched || chatSubmitAttempted) && chatValidationError ? (
+                <Text style={styles.chatComposerErrorText}>{chatValidationError}</Text>
+              ) : null}
 
               <View style={{ flexDirection: "row", justifyContent: "flex-end", marginTop: 12 }}>
                 <TouchableOpacity
                   style={[styles.shareBtn, styles.refreshBtn]}
-                  onPress={() => setChatOpen(false)}
+                  onPress={() => {
+                    setChatOpen(false);
+                    setChatTouched(false);
+                    setChatSubmitAttempted(false);
+                  }}
                   disabled={chatSending}
                 >
                   <Text style={[styles.shareBtnText, styles.refreshBtnText]}>Close</Text>
@@ -1210,9 +1320,13 @@ export default function DashboardScreen() {
                 <View style={{ width: 10 }} />
 
                 <TouchableOpacity
-                  style={[styles.shareBtn, { backgroundColor: theme.primary }]}
+                  style={[
+                    styles.shareBtn,
+                    { backgroundColor: theme.primary },
+                    (chatValidationError || chatSending) && styles.chatSendButtonDisabled,
+                  ]}
                   onPress={sendChatMessage}
-                  disabled={chatSending || !chatInput.trim()}
+                  disabled={chatSending}
                 >
                   {chatSending ? (
                     <ActivityIndicator color="#fff" />
@@ -1628,6 +1742,17 @@ function createStyles(theme: AppTheme) {
       minHeight: 52,
       maxHeight: 120,
       textAlignVertical: "top",
+    },
+    chatComposerInputError: {
+      borderColor: theme.danger,
+    },
+    chatComposerErrorText: {
+      color: theme.danger,
+      fontSize: 12,
+      marginTop: 6,
+    },
+    chatSendButtonDisabled: {
+      opacity: 0.6,
     },
     keyboardAvoiding: { flex: 1, width: "100%" },
     chatModalBackdrop: {

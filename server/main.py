@@ -1,10 +1,12 @@
 from typing import Generator, List, Optional, Dict, Any
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dt_time
+import math
 import secrets
 import string
 import hashlib
 import hmac
 import os
+import re
 from urllib.parse import urlparse
 
 import requests
@@ -171,6 +173,38 @@ class AlertDB(Base):
     created_at = Column(DateTime, nullable=False, server_default=func.now())
 
 
+class MedicationDB(Base):
+    __tablename__ = "medications"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+
+    name = Column(String(120), nullable=False)
+    dosage = Column(String(120), nullable=False, default="1 dose")
+    instructions = Column(String(255), nullable=True)
+    schedule_times = Column(String(120), nullable=False, default="08:00")  # CSV: HH:MM,HH:MM
+
+    pills_remaining = Column(Integer, nullable=False, default=0)
+    refill_threshold = Column(Integer, nullable=False, default=5)
+    is_active = Column(Integer, nullable=False, default=1)  # 0/1
+
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
+    updated_at = Column(DateTime, nullable=False, server_default=func.now(), onupdate=func.now())
+
+
+class MedicationLogDB(Base):
+    __tablename__ = "medication_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    medication_id = Column(Integer, ForeignKey("medications.id"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+
+    status = Column(String(16), nullable=False, default="taken")  # taken|missed
+    scheduled_at = Column(DateTime, nullable=True)
+    note = Column(String(255), nullable=True)
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
+
+
 # ===================== AUTH MODELS =====================
 
 class AuthUserDB(Base):
@@ -229,6 +263,224 @@ DELETE_REQUEST_DATA = "delete_data"
 DELETE_REQUEST_ACCOUNT = "delete_account"
 DELETE_REQUEST_ALLOWED = {DELETE_REQUEST_DATA, DELETE_REQUEST_ACCOUNT}
 
+MED_LOG_TAKEN = "taken"
+MED_LOG_MISSED = "missed"
+MED_LOG_ALLOWED = {MED_LOG_TAKEN, MED_LOG_MISSED}
+SCHEDULE_TIME_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+
+NAME_MIN_LENGTH = 2
+NAME_MAX_LENGTH = 100
+ROLE_MAX_LENGTH = 100
+PASSWORD_MIN_LENGTH = 8
+FAMILY_STEPS_GOAL_MAX = 100000
+FAMILY_SLEEP_GOAL_MIN = 1.0
+FAMILY_SLEEP_GOAL_MAX = 24.0
+FAMILY_CHAT_MESSAGE_MAX = 500
+MEDICATION_NAME_MAX = 120
+MEDICATION_DOSAGE_MAX = 120
+MEDICATION_INSTRUCTIONS_MAX = 255
+METRIC_HEART_RATE_MIN = 30
+METRIC_HEART_RATE_MAX = 240
+METRIC_WEIGHT_MIN = 1.0
+METRIC_WEIGHT_MAX = 500.0
+METRIC_STEPS_MAX = 100000
+METRIC_SLEEP_MAX = 24.0
+METRIC_BLOOD_GLUCOSE_MIN = 0.1
+METRIC_BLOOD_GLUCOSE_MAX = 40.0
+METRIC_SYSTOLIC_BP_MIN = 50
+METRIC_SYSTOLIC_BP_MAX = 260
+METRIC_DIASTOLIC_BP_MIN = 30
+METRIC_DIASTOLIC_BP_MAX = 180
+METRIC_CHOLESTEROL_MIN = 0.1
+METRIC_CHOLESTEROL_MAX = 20.0
+
+
+def trim_text(value: Optional[str]) -> str:
+    return (value or "").strip()
+
+
+def normalize_person_text(value: Optional[str]) -> str:
+    return re.sub(r"\s+", " ", trim_text(value))
+
+
+def validate_person_name(value: str, label: str) -> str:
+    cleaned = normalize_person_text(value)
+    if len(cleaned) < NAME_MIN_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{label} must be at least {NAME_MIN_LENGTH} characters",
+        )
+    if len(cleaned) > NAME_MAX_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{label} must be {NAME_MAX_LENGTH} characters or fewer",
+        )
+    return cleaned
+
+
+def validate_role_text(value: str) -> str:
+    cleaned = normalize_person_text(value)
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="Role cannot be empty")
+    if len(cleaned) > ROLE_MAX_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Role must be {ROLE_MAX_LENGTH} characters or fewer",
+        )
+    return cleaned
+
+
+def validate_email_value(value: str) -> str:
+    cleaned = trim_text(value).lower()
+    if not cleaned or not EMAIL_RE.match(cleaned):
+        raise HTTPException(status_code=400, detail="Invalid email")
+    if len(cleaned) > 255:
+        raise HTTPException(status_code=400, detail="Email is too long")
+    return cleaned
+
+
+def validate_password_strength(value: str) -> str:
+    if len(value) < PASSWORD_MIN_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Password must be at least {PASSWORD_MIN_LENGTH} characters",
+        )
+    if not re.search(r"\d", value):
+        raise HTTPException(status_code=400, detail="Password must include a number")
+    if not re.search(r"[^A-Za-z0-9]", value):
+        raise HTTPException(status_code=400, detail="Password must include a symbol")
+    return value
+
+
+def validate_family_steps_goal(value: int) -> int:
+    steps = int(value)
+    if steps <= 0:
+        raise HTTPException(status_code=400, detail="Steps goal must be greater than 0")
+    if steps > FAMILY_STEPS_GOAL_MAX:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Steps goal must be {FAMILY_STEPS_GOAL_MAX} or less",
+        )
+    return steps
+
+
+def validate_family_sleep_goal(value: float) -> float:
+    sleep = float(value)
+    if sleep < FAMILY_SLEEP_GOAL_MIN or sleep > FAMILY_SLEEP_GOAL_MAX:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Sleep goal must be between {int(FAMILY_SLEEP_GOAL_MIN)} "
+                f"and {int(FAMILY_SLEEP_GOAL_MAX)} hours"
+            ),
+        )
+    return sleep
+
+
+def validate_chat_message_text(value: str) -> str:
+    cleaned = re.sub(r"\s+", " ", trim_text(value))
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="Message cannot be empty")
+    if len(cleaned) > FAMILY_CHAT_MESSAGE_MAX:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Message is too long (max {FAMILY_CHAT_MESSAGE_MAX} chars)",
+        )
+    if not any(ch.isalnum() for ch in cleaned):
+        raise HTTPException(
+            status_code=400,
+            detail="Message must include letters or numbers",
+        )
+    return cleaned
+
+
+def validate_medication_name(value: str) -> str:
+    cleaned = normalize_person_text(value)
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="Medication name is required")
+    if len(cleaned) > MEDICATION_NAME_MAX:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Medication name must be {MEDICATION_NAME_MAX} characters or fewer",
+        )
+    return cleaned
+
+
+def validate_medication_dosage(value: Optional[str]) -> str:
+    cleaned = normalize_person_text(value or "1 dose") or "1 dose"
+    if len(cleaned) > MEDICATION_DOSAGE_MAX:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Dosage must be {MEDICATION_DOSAGE_MAX} characters or fewer",
+        )
+    return cleaned
+
+
+def validate_optional_text(value: Optional[str], label: str, max_length: int) -> Optional[str]:
+    if value is None:
+        return None
+    cleaned = trim_text(value)
+    if not cleaned:
+        return None
+    if len(cleaned) > max_length:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{label} must be {max_length} characters or fewer",
+        )
+    return cleaned
+
+
+def validate_non_negative_int(value: Optional[int], field_name: str, default: int) -> int:
+    number = int(default if value is None else value)
+    if number < 0:
+        raise HTTPException(status_code=400, detail=f"{field_name} cannot be negative")
+    return number
+
+
+def validate_medication_log_status(value: str) -> str:
+    status = trim_text(value).lower()
+    if status not in MED_LOG_ALLOWED:
+        raise HTTPException(status_code=400, detail="status must be 'taken' or 'missed'")
+    return status
+
+
+def validate_positive_int(value: int, field_name: str) -> int:
+    number = int(value)
+    if number <= 0:
+        raise HTTPException(status_code=400, detail=f"{field_name} must be greater than 0")
+    return number
+
+
+def validate_metric_number(
+    value: Optional[float],
+    field_name: str,
+    minimum: float,
+    maximum: float,
+    *,
+    integer: bool = False,
+) -> float:
+    if value is None:
+        raise HTTPException(status_code=400, detail=f"{field_name} is required")
+
+    number = float(value)
+    if not math.isfinite(number):
+        raise HTTPException(status_code=400, detail=f"{field_name} must be a valid number")
+
+    if integer and not number.is_integer():
+        raise HTTPException(status_code=400, detail=f"{field_name} must be a whole number")
+
+    if number < minimum or number > maximum:
+        min_display = int(minimum) if float(minimum).is_integer() else minimum
+        max_display = int(maximum) if float(maximum).is_integer() else maximum
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field_name} must be between {min_display} and {max_display}",
+        )
+
+    return int(number) if integer else number
+
+
 def latest_entry_for_user(db: Session, user_id: int):
     return (
         db.query(MetricEntryDB)
@@ -236,6 +488,109 @@ def latest_entry_for_user(db: Session, user_id: int):
         .order_by(MetricEntryDB.created_at.desc())
         .first()
     )
+
+
+def parse_schedule_times_csv(raw: str) -> List[str]:
+    values = [v.strip() for v in (raw or "").split(",") if v.strip()]
+    out: List[str] = []                    
+    seen = set()
+    for value in values:
+        if not SCHEDULE_TIME_RE.match(value):
+            continue
+        if value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    out.sort()
+    return out
+
+
+def normalize_schedule_times(values: List[str]) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for value in values:
+        vv = (value or "").strip()
+        if not SCHEDULE_TIME_RE.match(vv):
+            raise HTTPException(status_code=400, detail=f"Invalid schedule time: {value}")
+        if vv in seen:
+            continue
+        seen.add(vv)
+        out.append(vv)
+    out.sort()
+    if not out:
+        raise HTTPException(status_code=400, detail="At least one valid schedule time is required")
+    return out
+
+
+def parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).replace(tzinfo=None)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid datetime format")
+
+
+def get_next_medication_reminder(schedule_times: List[str], now: datetime) -> Optional[datetime]:
+    if not schedule_times:
+        return None
+    candidates: List[datetime] = []
+    for day_offset in [0, 1]:
+        date_value = (now + timedelta(days=day_offset)).date()
+        for clock in schedule_times:
+            hours, minutes = clock.split(":")
+            dt = datetime.combine(date_value, dt_time(int(hours), int(minutes)))
+            if dt >= now:
+                candidates.append(dt)
+    if not candidates:
+        return None
+    candidates.sort()
+    return candidates[0]
+
+
+def calculate_medication_adherence(
+    db: Session,
+    medication: MedicationDB,
+    now: datetime,
+    days: int,
+) -> float:
+    if days <= 0:
+        return 0.0
+    schedule_times = parse_schedule_times_csv(medication.schedule_times)
+    if not schedule_times:
+        return 0.0
+
+    since = now - timedelta(days=days)
+    start = medication.created_at or since
+    effective_start = since if start < since else start
+    covered_days = (now.date() - effective_start.date()).days + 1
+    if covered_days < 0:
+        covered_days = 0
+    expected = covered_days * len(schedule_times)
+    if expected <= 0:
+        return 0.0
+
+    taken = int(
+        db.query(func.count(MedicationLogDB.id))
+        .filter(
+            MedicationLogDB.medication_id == medication.id,
+            MedicationLogDB.user_id == medication.user_id,
+            MedicationLogDB.status == MED_LOG_TAKEN,
+            MedicationLogDB.created_at >= since,
+        )
+        .scalar()
+        or 0
+    )
+
+    ratio = (taken / expected) * 100.0
+    if ratio < 0:
+        ratio = 0.0
+    if ratio > 100:
+        ratio = 100.0
+    return round(ratio, 1)
 
 
 def generate_code(length: int = 6) -> str:
@@ -363,11 +718,13 @@ def create_or_get_pending_deletion_request(
 
 
 def execute_delete_my_data(db: Session, user_id: int):
-    membership = db.query(FamilyMemberDB).filter(FamilyMemberDB.user_id == user_id).first()
+    membership = get_active_family_membership(db, user_id)
     family_id = membership.family_id if membership else None
 
     db.query(MetricEntryDB).filter(MetricEntryDB.user_id == user_id).delete(synchronize_session=False)
     db.query(AlertDB).filter(AlertDB.user_id == user_id).delete(synchronize_session=False)
+    db.query(MedicationLogDB).filter(MedicationLogDB.user_id == user_id).delete(synchronize_session=False)
+    db.query(MedicationDB).filter(MedicationDB.user_id == user_id).delete(synchronize_session=False)
     db.query(FamilyChatMessageDB).filter(FamilyChatMessageDB.user_id == user_id).delete(synchronize_session=False)
 
     if family_id:
@@ -380,13 +737,15 @@ def execute_delete_my_data(db: Session, user_id: int):
 
 
 def execute_delete_my_account(db: Session, user_id: int):
-    membership = db.query(FamilyMemberDB).filter(FamilyMemberDB.user_id == user_id).first()
+    membership = get_active_family_membership(db, user_id)
     family_id = membership.family_id if membership else None
 
     db.query(AuthTokenDB).filter(AuthTokenDB.user_id == user_id).delete(synchronize_session=False)
 
     db.query(MetricEntryDB).filter(MetricEntryDB.user_id == user_id).delete(synchronize_session=False)
     db.query(AlertDB).filter(AlertDB.user_id == user_id).delete(synchronize_session=False)
+    db.query(MedicationLogDB).filter(MedicationLogDB.user_id == user_id).delete(synchronize_session=False)
+    db.query(MedicationDB).filter(MedicationDB.user_id == user_id).delete(synchronize_session=False)
     db.query(FamilyChatMessageDB).filter(FamilyChatMessageDB.user_id == user_id).delete(synchronize_session=False)
 
     if family_id:
@@ -466,8 +825,39 @@ def create_family_for_user(db: Session, user_id: int, family_name: str = "My Fam
     return family
 
 
+def get_active_family_membership(db: Session, user_id: int) -> Optional[FamilyMemberDB]:
+    memberships = (
+        db.query(FamilyMemberDB)
+        .filter(FamilyMemberDB.user_id == user_id)
+        .order_by(FamilyMemberDB.created_at.desc(), FamilyMemberDB.id.desc())
+        .all()
+    )
+    if not memberships:
+        return None
+
+    active = memberships[0]
+    stale_family_ids = [row.family_id for row in memberships[1:]]
+
+    for family_id in stale_family_ids:
+        leave_family_membership(db, user_id, family_id)
+
+    if stale_family_ids:
+        db.expire_all()
+        active = (
+            db.query(FamilyMemberDB)
+            .filter(
+                FamilyMemberDB.user_id == user_id,
+                FamilyMemberDB.family_id == active.family_id,
+            )
+            .order_by(FamilyMemberDB.created_at.desc(), FamilyMemberDB.id.desc())
+            .first()
+        )
+
+    return active
+
+
 def get_user_family_id(db: Session, user_id: int) -> Optional[int]:
-    row = db.query(FamilyMemberDB).filter(FamilyMemberDB.user_id == user_id).first()
+    row = get_active_family_membership(db, user_id)
     return row.family_id if row else None
 
 
@@ -793,6 +1183,40 @@ def save_alerts(db: Session, user_id: int, alerts: List[Dict[str, Any]]):
             metric_value=a.get("metric_value"),
             is_read=0,
         ))
+    db.commit()
+
+
+def create_family_join_alerts(db: Session, family_id: int, joined_user: UserDB):
+    joined_name = f"{joined_user.first_name} {joined_user.last_name}".strip() or "A family member"
+    recipient_ids = [
+        int(row.user_id)
+        for row in (
+            db.query(FamilyMemberDB.user_id)
+            .filter(
+                FamilyMemberDB.family_id == family_id,
+                FamilyMemberDB.user_id != joined_user.id,
+            )
+            .all()
+        )
+    ]
+
+    if not recipient_ids:
+        return
+
+    for recipient_id in recipient_ids:
+        db.add(
+            AlertDB(
+                user_id=recipient_id,
+                category="family",
+                title="New family member",
+                message=f"{joined_name} joined your family group.",
+                severity="info",
+                metric_type=None,
+                metric_value=None,
+                is_read=0,
+            )
+        )
+
     db.commit()
 
 
@@ -1175,6 +1599,130 @@ class DeletionRequestDecision(BaseModel):
     note: Optional[str] = None
 
 
+class AdminOverview(BaseModel):
+    totalUsers: int
+    totalFamilies: int
+    totalFamilyMembers: int
+    totalMetricEntries: int
+    metricsLast24h: int
+    alertsLast24h: int
+    pendingDeletionRequests: int
+
+
+class AdminUserItem(BaseModel):
+    id: int
+    name: str
+    role: str
+    email: Optional[str] = None
+    familyId: Optional[int] = None
+    familyName: Optional[str] = None
+    lastMetricAt: Optional[str] = None
+    pendingDeletionRequests: int = 0
+
+
+class AdminFamilyItem(BaseModel):
+    id: int
+    name: str
+    ownerUserId: int
+    ownerName: Optional[str] = None
+    memberCount: int
+    stepsGoal: int
+    sleepGoal: float
+    createdAt: Optional[str] = None
+
+
+class AdminAlertItem(BaseModel):
+    id: int
+    userId: int
+    userName: str
+    severity: str
+    category: str
+    title: str
+    message: str
+    metricType: Optional[str] = None
+    metricValue: Optional[float] = None
+    isRead: int
+    createdAt: str
+
+
+class AdminUpdateUserRoleRequest(BaseModel):
+    role: str
+
+
+class MedicationItem(BaseModel):
+    id: int
+    name: str
+    dosage: str
+    instructions: Optional[str] = None
+    scheduleTimes: List[str]
+    pillsRemaining: int
+    refillThreshold: int
+    isActive: bool
+    adherence7d: float
+    adherence30d: float
+    nextReminderAt: Optional[str] = None
+    dueSoon: bool
+    refillAlert: bool
+    lastLogStatus: Optional[str] = None
+    lastLogAt: Optional[str] = None
+    createdAt: Optional[str] = None
+    updatedAt: Optional[str] = None
+
+
+class MedicationSummary(BaseModel):
+    totalMedications: int
+    activeMedications: int
+    dueSoonCount: int
+    refillAlertCount: int
+    averageAdherence7d: float
+    averageAdherence30d: float
+
+
+class MedicationOverviewResponse(BaseModel):
+    summary: MedicationSummary
+    medications: List[MedicationItem]
+
+
+class MedicationCreateRequest(BaseModel):
+    name: str
+    dosage: Optional[str] = "1 dose"
+    instructions: Optional[str] = None
+    scheduleTimes: List[str]
+    pillsRemaining: Optional[int] = 0
+    refillThreshold: Optional[int] = 5
+    isActive: Optional[bool] = True
+
+
+class MedicationUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    dosage: Optional[str] = None
+    instructions: Optional[str] = None
+    scheduleTimes: Optional[List[str]] = None
+    pillsRemaining: Optional[int] = None
+    refillThreshold: Optional[int] = None
+    isActive: Optional[bool] = None
+
+
+class MedicationLogCreateRequest(BaseModel):
+    status: str
+    scheduledAt: Optional[str] = None
+    note: Optional[str] = None
+
+
+class MedicationLogItem(BaseModel):
+    id: int
+    medicationId: int
+    status: str
+    scheduledAt: Optional[str] = None
+    note: Optional[str] = None
+    createdAt: str
+
+
+class MedicationLogActionResponse(BaseModel):
+    detail: str
+    medication: MedicationItem
+
+
 class RecommendationItem(BaseModel):
     title: str
     summary: Optional[str] = ""
@@ -1249,6 +1797,77 @@ def filter_metrics_by_consent(full: Optional[Metrics], consent: Dict[str, bool])
     )
 
 
+def medication_item_from_row(
+    db: Session,
+    row: MedicationDB,
+    now: Optional[datetime] = None,
+) -> MedicationItem:
+    current = now or datetime.utcnow()
+    schedule_times = parse_schedule_times_csv(row.schedule_times)
+    next_reminder = get_next_medication_reminder(schedule_times, current) if row.is_active else None
+    due_soon = False
+    if next_reminder:
+        seconds = (next_reminder - current).total_seconds()
+        due_soon = 0 <= seconds <= 3600
+
+    latest_log = (
+        db.query(MedicationLogDB)
+        .filter(
+            MedicationLogDB.medication_id == row.id,
+            MedicationLogDB.user_id == row.user_id,
+        )
+        .order_by(MedicationLogDB.created_at.desc(), MedicationLogDB.id.desc())
+        .first()
+    )
+
+    adherence_7d = calculate_medication_adherence(db, row, current, 7)
+    adherence_30d = calculate_medication_adherence(db, row, current, 30)
+
+    return MedicationItem(
+        id=row.id,
+        name=row.name,
+        dosage=row.dosage,
+        instructions=row.instructions,
+        scheduleTimes=schedule_times,
+        pillsRemaining=int(row.pills_remaining or 0),
+        refillThreshold=int(row.refill_threshold or 0),
+        isActive=bool(row.is_active),
+        adherence7d=adherence_7d,
+        adherence30d=adherence_30d,
+        nextReminderAt=next_reminder.isoformat() if next_reminder else None,
+        dueSoon=due_soon,
+        refillAlert=bool(row.pills_remaining <= row.refill_threshold),
+        lastLogStatus=latest_log.status if latest_log else None,
+        lastLogAt=latest_log.created_at.isoformat() if latest_log and latest_log.created_at else None,
+        createdAt=row.created_at.isoformat() if row.created_at else None,
+        updatedAt=row.updated_at.isoformat() if row.updated_at else None,
+    )
+
+
+def medication_summary_from_items(items: List[MedicationItem]) -> MedicationSummary:
+    if not items:
+        return MedicationSummary(
+            totalMedications=0,
+            activeMedications=0,
+            dueSoonCount=0,
+            refillAlertCount=0,
+            averageAdherence7d=0.0,
+            averageAdherence30d=0.0,
+        )
+
+    active_items = [item for item in items if item.isActive]
+    average7 = round(sum(item.adherence7d for item in items) / len(items), 1)
+    average30 = round(sum(item.adherence30d for item in items) / len(items), 1)
+    return MedicationSummary(
+        totalMedications=len(items),
+        activeMedications=len(active_items),
+        dueSoonCount=sum(1 for item in items if item.dueSoon),
+        refillAlertCount=sum(1 for item in items if item.refillAlert),
+        averageAdherence7d=average7,
+        averageAdherence30d=average30,
+    )
+
+
 # ===================== APP =====================
 
 app = FastAPI(title="CheckMi Backend")
@@ -1273,18 +1892,15 @@ def root():
 
 @app.post("/auth/signup")
 def signup(payload: SignupRequest, db: Session = Depends(get_db)):
-    email = normalize_email(payload.email)
-    if not email or "@" not in email:
-        raise HTTPException(status_code=400, detail="Invalid email")
+    email = validate_email_value(payload.email)
 
     existing = db.query(AuthUserDB).filter(AuthUserDB.email == email).first()
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
 
-    first = payload.firstName.strip()
-    last = payload.lastName.strip()
-    if not first or not last:
-        raise HTTPException(status_code=400, detail="First name and last name are required")
+    first = validate_person_name(payload.firstName, "First name")
+    last = validate_person_name(payload.lastName, "Last name")
+    validate_password_strength(payload.password)
 
     user = UserDB(first_name=first, last_name=last, role="Self")
     db.add(user)
@@ -1380,28 +1996,17 @@ def update_me(
 ):
     # Update user table fields
     if payload.firstName is not None:
-        v = payload.firstName.strip()
-        if not v:
-            raise HTTPException(status_code=400, detail="First name cannot be empty")
-        user.first_name = v
+        user.first_name = validate_person_name(payload.firstName, "First name")
 
     if payload.lastName is not None:
-        v = payload.lastName.strip()
-        if not v:
-            raise HTTPException(status_code=400, detail="Last name cannot be empty")
-        user.last_name = v
+        user.last_name = validate_person_name(payload.lastName, "Last name")
 
     if payload.role is not None:
-        v = payload.role.strip()
-        if not v:
-            raise HTTPException(status_code=400, detail="Role cannot be empty")
-        user.role = v
+        user.role = validate_role_text(payload.role)
 
     # Update email in auth_users
     if payload.email is not None:
-        v = normalize_email(payload.email)
-        if not v or "@" not in v:
-            raise HTTPException(status_code=400, detail="Invalid email")
+        v = validate_email_value(payload.email)
 
         auth_row = db.query(AuthUserDB).filter(AuthUserDB.user_id == user.id).first()
         if not auth_row:
@@ -1474,34 +2079,335 @@ def get_my_history(user: UserDB = Depends(get_current_user), db: Session = Depen
 
 @app.put("/me/metrics", response_model=UserSummary)
 def add_my_metrics(payload: Metrics, user: UserDB = Depends(get_current_user), db: Session = Depends(get_db)):
-    # Metrics schema is Optional because of consent filtering, but logging requires all fields
-    required = ["heartRate", "weight", "steps", "sleep", "bloodGlucose", "systolicBP", "diastolicBP", "cholesterol"]
-    missing = [k for k in required if getattr(payload, k) is None]
-    if missing:
-        raise HTTPException(status_code=400, detail=f"Missing required metric fields: {', '.join(missing)}")
+    heart_rate = validate_metric_number(
+        payload.heartRate,
+        "Heart Rate",
+        METRIC_HEART_RATE_MIN,
+        METRIC_HEART_RATE_MAX,
+        integer=True,
+    )
+    weight = validate_metric_number(
+        payload.weight,
+        "Weight",
+        METRIC_WEIGHT_MIN,
+        METRIC_WEIGHT_MAX,
+    )
+    steps = validate_metric_number(
+        payload.steps,
+        "Steps",
+        0,
+        METRIC_STEPS_MAX,
+        integer=True,
+    )
+    sleep = validate_metric_number(
+        payload.sleep,
+        "Sleep",
+        0,
+        METRIC_SLEEP_MAX,
+    )
+    blood_glucose = validate_metric_number(
+        payload.bloodGlucose,
+        "Blood Glucose",
+        METRIC_BLOOD_GLUCOSE_MIN,
+        METRIC_BLOOD_GLUCOSE_MAX,
+    )
+    systolic_bp = validate_metric_number(
+        payload.systolicBP,
+        "Systolic BP",
+        METRIC_SYSTOLIC_BP_MIN,
+        METRIC_SYSTOLIC_BP_MAX,
+        integer=True,
+    )
+    diastolic_bp = validate_metric_number(
+        payload.diastolicBP,
+        "Diastolic BP",
+        METRIC_DIASTOLIC_BP_MIN,
+        METRIC_DIASTOLIC_BP_MAX,
+        integer=True,
+    )
+    cholesterol = validate_metric_number(
+        payload.cholesterol,
+        "Cholesterol",
+        METRIC_CHOLESTEROL_MIN,
+        METRIC_CHOLESTEROL_MAX,
+    )
+
+    validated_metrics = Metrics(
+        heartRate=int(heart_rate),
+        weight=weight,
+        steps=int(steps),
+        sleep=sleep,
+        bloodGlucose=blood_glucose,
+        systolicBP=int(systolic_bp),
+        diastolicBP=int(diastolic_bp),
+        cholesterol=cholesterol,
+    )
 
     entry = MetricEntryDB(
         user_id=user.id,
-        heart_rate=payload.heartRate,
-        weight=payload.weight,
-        steps=int(payload.steps),
-        sleep=payload.sleep,
-        blood_glucose=payload.bloodGlucose,
-        systolic_bp=payload.systolicBP,
-        diastolic_bp=payload.diastolicBP,
-        cholesterol=payload.cholesterol,
+        heart_rate=validated_metrics.heartRate,
+        weight=validated_metrics.weight,
+        steps=validated_metrics.steps,
+        sleep=validated_metrics.sleep,
+        blood_glucose=validated_metrics.bloodGlucose,
+        systolic_bp=validated_metrics.systolicBP,
+        diastolic_bp=validated_metrics.diastolicBP,
+        cholesterol=validated_metrics.cholesterol,
     )
     db.add(entry)
     db.commit()
 
-    alerts = build_alerts_from_metrics(payload.dict())
+    alerts = build_alerts_from_metrics(validated_metrics.dict())
     if alerts:
         save_alerts(db, user.id, alerts)
 
     return UserSummary(
         name=f"{user.first_name} {user.last_name}",
         role=user.role,
-        metrics=payload,
+        metrics=validated_metrics,
+    )
+
+
+@app.get("/me/medications", response_model=MedicationOverviewResponse)
+def get_my_medications(
+    user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    rows = (
+        db.query(MedicationDB)
+        .filter(MedicationDB.user_id == user.id)
+        .order_by(MedicationDB.is_active.desc(), MedicationDB.created_at.desc(), MedicationDB.id.desc())
+        .all()
+    )
+    now = datetime.utcnow()
+    items = [medication_item_from_row(db, row, now=now) for row in rows]
+
+    def item_sort_key(item: MedicationItem):
+        if item.nextReminderAt:
+            try:
+                next_dt = datetime.fromisoformat(item.nextReminderAt)
+            except ValueError:
+                next_dt = datetime.max
+        else:
+            next_dt = datetime.max
+        return (
+            0 if item.dueSoon else 1,
+            0 if item.nextReminderAt else 1,
+            next_dt,
+            (item.name or "").lower(),
+        )
+
+    items.sort(key=item_sort_key)
+    summary = medication_summary_from_items(items)
+    return MedicationOverviewResponse(summary=summary, medications=items)
+
+
+@app.post("/me/medications", response_model=MedicationItem)
+def create_my_medication(
+    payload: MedicationCreateRequest,
+    user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    name = validate_medication_name(payload.name)
+    schedule_times = normalize_schedule_times(payload.scheduleTimes)
+
+    dosage = validate_medication_dosage(payload.dosage)
+    instructions = validate_optional_text(
+        payload.instructions,
+        "Instructions",
+        MEDICATION_INSTRUCTIONS_MAX,
+    )
+    pills_remaining = validate_non_negative_int(
+        payload.pillsRemaining,
+        "pillsRemaining",
+        0,
+    )
+    refill_threshold = validate_non_negative_int(
+        payload.refillThreshold,
+        "refillThreshold",
+        5,
+    )
+
+    row = MedicationDB(
+        user_id=user.id,
+        name=name,
+        dosage=dosage,
+        instructions=instructions,
+        schedule_times=",".join(schedule_times),
+        pills_remaining=pills_remaining,
+        refill_threshold=refill_threshold,
+        is_active=1 if payload.isActive is not False else 0,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return medication_item_from_row(db, row)
+
+
+@app.put("/me/medications/{medication_id}", response_model=MedicationItem)
+def update_my_medication(
+    medication_id: int,
+    payload: MedicationUpdateRequest,
+    user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    row = (
+        db.query(MedicationDB)
+        .filter(MedicationDB.id == medication_id, MedicationDB.user_id == user.id)
+        .first()
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Medication not found")
+
+    if payload.name is not None:
+        row.name = validate_medication_name(payload.name)
+
+    if payload.dosage is not None:
+        row.dosage = validate_medication_dosage(payload.dosage)
+
+    if payload.instructions is not None:
+        row.instructions = validate_optional_text(
+            payload.instructions,
+            "Instructions",
+            MEDICATION_INSTRUCTIONS_MAX,
+        )
+
+    if payload.scheduleTimes is not None:
+        schedule_times = normalize_schedule_times(payload.scheduleTimes)
+        row.schedule_times = ",".join(schedule_times)
+
+    if payload.pillsRemaining is not None:
+        row.pills_remaining = validate_non_negative_int(
+            payload.pillsRemaining,
+            "pillsRemaining",
+            0,
+        )
+
+    if payload.refillThreshold is not None:
+        row.refill_threshold = validate_non_negative_int(
+            payload.refillThreshold,
+            "refillThreshold",
+            0,
+        )
+
+    if payload.isActive is not None:
+        row.is_active = 1 if payload.isActive else 0
+
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return medication_item_from_row(db, row)
+
+
+@app.delete("/me/medications/{medication_id}")
+def delete_my_medication(
+    medication_id: int,
+    user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    row = (
+        db.query(MedicationDB)
+        .filter(MedicationDB.id == medication_id, MedicationDB.user_id == user.id)
+        .first()
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Medication not found")
+
+    db.query(MedicationLogDB).filter(
+        MedicationLogDB.medication_id == row.id,
+        MedicationLogDB.user_id == user.id,
+    ).delete(synchronize_session=False)
+    db.delete(row)
+    db.commit()
+    return {"detail": "Medication deleted."}
+
+
+@app.get("/me/medications/{medication_id}/logs", response_model=List[MedicationLogItem])
+def get_my_medication_logs(
+    medication_id: int,
+    days: int = 14,
+    limit: int = 120,
+    user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    row = (
+        db.query(MedicationDB)
+        .filter(MedicationDB.id == medication_id, MedicationDB.user_id == user.id)
+        .first()
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Medication not found")
+
+    safe_days = max(1, min(days, 90))
+    safe_limit = max(1, min(limit, 500))
+    since = datetime.utcnow() - timedelta(days=safe_days)
+
+    logs = (
+        db.query(MedicationLogDB)
+        .filter(
+            MedicationLogDB.medication_id == row.id,
+            MedicationLogDB.user_id == user.id,
+            MedicationLogDB.created_at >= since,
+        )
+        .order_by(MedicationLogDB.created_at.desc(), MedicationLogDB.id.desc())
+        .limit(safe_limit)
+        .all()
+    )
+
+    return [
+        MedicationLogItem(
+            id=log.id,
+            medicationId=log.medication_id,
+            status=log.status,
+            scheduledAt=log.scheduled_at.isoformat() if log.scheduled_at else None,
+            note=log.note,
+            createdAt=log.created_at.isoformat() if log.created_at else "",
+        )
+        for log in logs
+    ]
+
+
+@app.post("/me/medications/{medication_id}/logs", response_model=MedicationLogActionResponse)
+def create_my_medication_log(
+    medication_id: int,
+    payload: MedicationLogCreateRequest,
+    user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    row = (
+        db.query(MedicationDB)
+        .filter(MedicationDB.id == medication_id, MedicationDB.user_id == user.id)
+        .first()
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Medication not found")
+
+    status = validate_medication_log_status(payload.status)
+    note = validate_optional_text(
+        payload.note,
+        "Medication note",
+        MEDICATION_INSTRUCTIONS_MAX,
+    )
+    scheduled_at = parse_iso_datetime(payload.scheduledAt)
+    log = MedicationLogDB(
+        medication_id=row.id,
+        user_id=user.id,
+        status=status,
+        scheduled_at=scheduled_at,
+        note=note,
+    )
+    db.add(log)
+
+    if status == MED_LOG_TAKEN and row.pills_remaining > 0:
+        row.pills_remaining -= 1
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+
+    updated_item = medication_item_from_row(db, row)
+    return MedicationLogActionResponse(
+        detail=f"Dose marked as {status}.",
+        medication=updated_item,
     )
 
 
@@ -1517,7 +2423,7 @@ def export_my_data(
     auth_row = db.query(AuthUserDB).filter(AuthUserDB.user_id == user.id).first()
 
     # Family membership + family details
-    membership = db.query(FamilyMemberDB).filter(FamilyMemberDB.user_id == user.id).first()
+    membership = get_active_family_membership(db, user.id)
     family = None
     share_code = None
     family_goals = None
@@ -1703,6 +2609,7 @@ def admin_list_deletion_requests(
 @app.post("/admin/deletion-requests/{request_id}/approve")
 def admin_approve_deletion_request(
     request_id: int,
+    payload: Optional[DeletionRequestDecision] = None,
     admin_username: str = Depends(get_current_admin),
     db: Session = Depends(get_db),
 ):
@@ -1734,8 +2641,11 @@ def admin_approve_deletion_request(
     row.status = "approved"
     row.reviewed_by = admin_username
     row.reviewed_at = datetime.utcnow()
+    note = ((payload.note if payload else None) or "").strip()
     if not user_exists:
         row.review_note = "Approved: user no longer exists."
+    elif note:
+        row.review_note = note
     db.add(row)
     db.commit()
 
@@ -1772,6 +2682,318 @@ def admin_reject_deletion_request(
         "requestId": request_id,
         "status": row.status,
     }
+
+
+@app.get("/admin/overview", response_model=AdminOverview)
+def admin_get_overview(
+    admin_username: str = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    _ = admin_username  # auth gate
+    now = datetime.utcnow()
+    since_24h = now - timedelta(hours=24)
+
+    return AdminOverview(
+        totalUsers=int(db.query(func.count(UserDB.id)).scalar() or 0),
+        totalFamilies=int(db.query(func.count(FamilyDB.id)).scalar() or 0),
+        totalFamilyMembers=int(db.query(func.count(FamilyMemberDB.id)).scalar() or 0),
+        totalMetricEntries=int(db.query(func.count(MetricEntryDB.id)).scalar() or 0),
+        metricsLast24h=int(
+            db.query(func.count(MetricEntryDB.id))
+            .filter(MetricEntryDB.created_at >= since_24h)
+            .scalar()
+            or 0
+        ),
+        alertsLast24h=int(
+            db.query(func.count(AlertDB.id))
+            .filter(AlertDB.created_at >= since_24h)
+            .scalar()
+            or 0
+        ),
+        pendingDeletionRequests=int(
+            db.query(func.count(DataDeletionRequestDB.id))
+            .filter(DataDeletionRequestDB.status == "pending")
+            .scalar()
+            or 0
+        ),
+    )
+
+
+@app.get("/admin/users", response_model=List[AdminUserItem])
+def admin_list_users(
+    query: str = "",
+    limit: int = 120,
+    admin_username: str = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    _ = admin_username  # auth gate
+    safe_limit = max(1, min(limit, 300))
+    q = (query or "").strip().lower()
+
+    users = db.query(UserDB).order_by(UserDB.id.desc()).all()
+    if not users:
+        return []
+
+    emails_by_user: Dict[int, str] = {
+        int(row.user_id): row.email
+        for row in db.query(AuthUserDB.user_id, AuthUserDB.email).all()
+    }
+
+    family_id_by_user: Dict[int, int] = {
+        int(row.user_id): int(row.family_id)
+        for row in db.query(FamilyMemberDB.user_id, FamilyMemberDB.family_id).all()
+    }
+    family_name_by_id: Dict[int, str] = {
+        int(row.id): row.name
+        for row in db.query(FamilyDB.id, FamilyDB.name).all()
+    }
+
+    latest_metric_rows = (
+        db.query(
+            MetricEntryDB.user_id.label("user_id"),
+            func.max(MetricEntryDB.created_at).label("latest_at"),
+        )
+        .group_by(MetricEntryDB.user_id)
+        .all()
+    )
+    latest_metric_at_by_user: Dict[int, Any] = {
+        int(row.user_id): row.latest_at for row in latest_metric_rows
+    }
+
+    pending_request_rows = (
+        db.query(
+            DataDeletionRequestDB.user_id.label("user_id"),
+            func.count(DataDeletionRequestDB.id).label("count"),
+        )
+        .filter(DataDeletionRequestDB.status == "pending")
+        .group_by(DataDeletionRequestDB.user_id)
+        .all()
+    )
+    pending_count_by_user: Dict[int, int] = {
+        int(row.user_id): int(row.count or 0) for row in pending_request_rows
+    }
+
+    out: List[AdminUserItem] = []
+    for user in users:
+        name = f"{user.first_name} {user.last_name}".strip()
+        family_id = family_id_by_user.get(user.id)
+        family_name = family_name_by_id.get(family_id) if family_id else None
+        latest_metric_at = latest_metric_at_by_user.get(user.id)
+
+        item = AdminUserItem(
+            id=user.id,
+            name=name,
+            role=user.role or "Self",
+            email=emails_by_user.get(user.id),
+            familyId=family_id,
+            familyName=family_name,
+            lastMetricAt=latest_metric_at.isoformat() if latest_metric_at else None,
+            pendingDeletionRequests=pending_count_by_user.get(user.id, 0),
+        )
+
+        if q:
+            haystack = " ".join(
+                [
+                    str(item.id),
+                    item.name or "",
+                    item.role or "",
+                    item.email or "",
+                    item.familyName or "",
+                ]
+            ).lower()
+            if q not in haystack:
+                continue
+
+        out.append(item)
+        if len(out) >= safe_limit:
+            break
+
+    return out
+
+
+@app.put("/admin/users/{user_id}/role", response_model=AdminUserItem)
+def admin_update_user_role(
+    user_id: int,
+    payload: AdminUpdateUserRoleRequest,
+    admin_username: str = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    _ = admin_username  # auth gate
+    new_role = (payload.role or "").strip()
+    if not new_role:
+        raise HTTPException(status_code=400, detail="Role is required")
+
+    user = db.query(UserDB).filter(UserDB.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    user.role = new_role[:100]
+    db.add(user)
+    db.commit()
+
+    auth_row = db.query(AuthUserDB).filter(AuthUserDB.user_id == user.id).first()
+    membership = get_active_family_membership(db, user.id)
+    family = db.query(FamilyDB).filter(FamilyDB.id == membership.family_id).first() if membership else None
+    latest_metric = (
+        db.query(MetricEntryDB.created_at)
+        .filter(MetricEntryDB.user_id == user.id)
+        .order_by(MetricEntryDB.created_at.desc())
+        .first()
+    )
+    pending_count = int(
+        db.query(func.count(DataDeletionRequestDB.id))
+        .filter(
+            DataDeletionRequestDB.user_id == user.id,
+            DataDeletionRequestDB.status == "pending",
+        )
+        .scalar()
+        or 0
+    )
+
+    latest_metric_at = latest_metric[0] if latest_metric else None
+    return AdminUserItem(
+        id=user.id,
+        name=f"{user.first_name} {user.last_name}",
+        role=user.role or "Self",
+        email=auth_row.email if auth_row else None,
+        familyId=membership.family_id if membership else None,
+        familyName=family.name if family else None,
+        lastMetricAt=latest_metric_at.isoformat() if latest_metric_at else None,
+        pendingDeletionRequests=pending_count,
+    )
+
+
+@app.get("/admin/families", response_model=List[AdminFamilyItem])
+def admin_list_families(
+    query: str = "",
+    limit: int = 120,
+    admin_username: str = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    _ = admin_username  # auth gate
+    safe_limit = max(1, min(limit, 300))
+    q = (query or "").strip().lower()
+
+    families = (
+        db.query(FamilyDB)
+        .order_by(FamilyDB.created_at.desc(), FamilyDB.id.desc())
+        .all()
+    )
+    if not families:
+        return []
+
+    member_count_rows = (
+        db.query(
+            FamilyMemberDB.family_id.label("family_id"),
+            func.count(FamilyMemberDB.id).label("count"),
+        )
+        .group_by(FamilyMemberDB.family_id)
+        .all()
+    )
+    member_count_by_family: Dict[int, int] = {
+        int(row.family_id): int(row.count or 0) for row in member_count_rows
+    }
+
+    goals_by_family: Dict[int, FamilyGoalDB] = {
+        int(row.family_id): row for row in db.query(FamilyGoalDB).all()
+    }
+
+    owner_name_by_user_id: Dict[int, str] = {
+        int(row.id): f"{row.first_name} {row.last_name}".strip()
+        for row in db.query(UserDB.id, UserDB.first_name, UserDB.last_name).all()
+    }
+
+    out: List[AdminFamilyItem] = []
+    for family in families:
+        owner_name = owner_name_by_user_id.get(family.owner_user_id, f"User #{family.owner_user_id}")
+        goals = goals_by_family.get(family.id)
+        steps_goal = goals.steps_goal if goals else DEFAULT_FAMILY_STEPS_GOAL
+        sleep_goal = goals.sleep_goal if goals else DEFAULT_FAMILY_SLEEP_GOAL
+
+        item = AdminFamilyItem(
+            id=family.id,
+            name=family.name,
+            ownerUserId=family.owner_user_id,
+            ownerName=owner_name,
+            memberCount=member_count_by_family.get(family.id, 0),
+            stepsGoal=steps_goal,
+            sleepGoal=sleep_goal,
+            createdAt=family.created_at.isoformat() if family.created_at else None,
+        )
+
+        if q:
+            haystack = " ".join(
+                [
+                    str(item.id),
+                    item.name or "",
+                    item.ownerName or "",
+                ]
+            ).lower()
+            if q not in haystack:
+                continue
+
+        out.append(item)
+        if len(out) >= safe_limit:
+            break
+
+    return out
+
+
+@app.get("/admin/alerts", response_model=List[AdminAlertItem])
+def admin_list_alerts(
+    severity: str = "all",
+    unread_only: int = 0,
+    limit: int = 120,
+    admin_username: str = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    _ = admin_username  # auth gate
+    normalized_severity = (severity or "all").strip().lower()
+    if normalized_severity not in {"all", "info", "warning", "urgent"}:
+        raise HTTPException(status_code=400, detail="Invalid severity filter")
+
+    safe_limit = max(1, min(limit, 500))
+    q = db.query(AlertDB)
+    if normalized_severity != "all":
+        q = q.filter(AlertDB.severity == normalized_severity)
+    if int(unread_only or 0) == 1:
+        q = q.filter(AlertDB.is_read == 0)
+
+    rows = (
+        q.order_by(AlertDB.created_at.desc(), AlertDB.id.desc())
+        .limit(safe_limit)
+        .all()
+    )
+    if not rows:
+        return []
+
+    user_ids = list({row.user_id for row in rows})
+    user_name_by_id: Dict[int, str] = {
+        int(row.id): f"{row.first_name} {row.last_name}".strip()
+        for row in db.query(UserDB.id, UserDB.first_name, UserDB.last_name)
+        .filter(UserDB.id.in_(user_ids))
+        .all()
+    } if user_ids else {}
+
+    out: List[AdminAlertItem] = []
+    for row in rows:
+        out.append(
+            AdminAlertItem(
+                id=row.id,
+                userId=row.user_id,
+                userName=user_name_by_id.get(row.user_id, f"User #{row.user_id}"),
+                severity=row.severity,
+                category=row.category,
+                title=row.title,
+                message=row.message,
+                metricType=row.metric_type,
+                metricValue=row.metric_value,
+                isRead=int(row.is_read or 0),
+                createdAt=row.created_at.isoformat() if row.created_at else "",
+            )
+        )
+
+    return out
 
 
 # ===================== CONSENT ROUTES =====================
@@ -2137,14 +3359,10 @@ def update_family_goals(
     goals = get_or_create_family_goals(db, family_id)
 
     if payload.steps is not None:
-        if payload.steps <= 0:
-            raise HTTPException(status_code=400, detail="Steps goal must be greater than 0")
-        goals.steps_goal = int(payload.steps)
+        goals.steps_goal = validate_family_steps_goal(payload.steps)
 
     if payload.sleep is not None:
-        if payload.sleep <= 0 or payload.sleep > 24:
-            raise HTTPException(status_code=400, detail="Sleep goal must be between 0 and 24 hours")
-        goals.sleep_goal = float(payload.sleep)
+        goals.sleep_goal = validate_family_sleep_goal(payload.sleep)
 
     db.add(goals)
     db.commit()
@@ -2208,14 +3426,11 @@ def post_family_chat_message(
     db: Session = Depends(get_db),
 ):
     family_id = ensure_user_has_family(db, user)
-    text = payload.message.strip()
-    if not text:
-        raise HTTPException(status_code=400, detail="Message cannot be empty")
-    if len(text) > 1000:
-        raise HTTPException(status_code=400, detail="Message is too long (max 1000 chars)")
+    text = validate_chat_message_text(payload.message)
 
     parent_id: Optional[int] = None
     if payload.parentId is not None:
+        validate_positive_int(payload.parentId, "parentId")
         parent = (
             db.query(FamilyChatMessageDB)
             .filter(
@@ -2331,11 +3546,7 @@ def join_family(payload: JoinFamilyRequest, user: UserDB = Depends(get_current_u
     if not row:
         raise HTTPException(status_code=404, detail="Invalid code")
 
-    current_membership = (
-        db.query(FamilyMemberDB)
-        .filter(FamilyMemberDB.user_id == user.id)
-        .first()
-    )
+    current_membership = get_active_family_membership(db, user.id)
 
     if current_membership and current_membership.family_id == row.family_id:
         ensure_default_consent_rows(db, row.family_id, user.id)
@@ -2355,6 +3566,7 @@ def join_family(payload: JoinFamilyRequest, user: UserDB = Depends(get_current_u
 
     # Create consent rows for the user in the new family
     ensure_default_consent_rows(db, row.family_id, user.id)
+    create_family_join_alerts(db, row.family_id, user)
 
     return {"message": "Joined family successfully"}
 
@@ -2364,11 +3576,7 @@ def leave_family(
     user: UserDB = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    membership = (
-        db.query(FamilyMemberDB)
-        .filter(FamilyMemberDB.user_id == user.id)
-        .first()
-    )
+    membership = get_active_family_membership(db, user.id)
     if not membership:
         raise HTTPException(status_code=404, detail="You are not in a family")
 

@@ -16,6 +16,13 @@ import { getToken } from "../src/auth";
 import { AppTheme, useAppTheme } from "../src/theme-mode";
 
 const BASE_URL = getApiBaseUrl();
+const MAX_NAME_LENGTH = 100;
+const MAX_ROLE_LENGTH = 100;
+const MAX_EMAIL_LENGTH = 255;
+
+function isValidEmail(value: string): boolean {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim());
+}
 
 type MeProfile = {
   id: number;
@@ -101,11 +108,19 @@ export default function ProfileScreen() {
       const r = role.trim();
       const em = email.trim();
 
-      if (!fn || !ln || !r) {
+      if (fn.length < 2 || ln.length < 2 || !r) {
         Alert.alert("Missing info", "First name, last name and role are required.");
         return;
       }
-      if (em && !em.includes("@")) {
+      if (fn.length > MAX_NAME_LENGTH || ln.length > MAX_NAME_LENGTH) {
+        Alert.alert("Name too long", `Names must be ${MAX_NAME_LENGTH} characters or fewer.`);
+        return;
+      }
+      if (r.length > MAX_ROLE_LENGTH) {
+        Alert.alert("Role too long", `Role must be ${MAX_ROLE_LENGTH} characters or fewer.`);
+        return;
+      }
+      if (em && !isValidEmail(em)) {
         Alert.alert("Invalid email", "Please enter a valid email.");
         return;
       }
@@ -166,13 +181,30 @@ export default function ProfileScreen() {
 
       <View style={styles.card}>
         <Text style={styles.label}>First name</Text>
-        <TextInput style={styles.input} value={firstName} onChangeText={setFirstName} />
+        <TextInput
+          style={styles.input}
+          value={firstName}
+          onChangeText={setFirstName}
+          maxLength={MAX_NAME_LENGTH}
+        />
 
         <Text style={styles.label}>Last name</Text>
-        <TextInput style={styles.input} value={lastName} onChangeText={setLastName} />
+        <TextInput
+          style={styles.input}
+          value={lastName}
+          onChangeText={setLastName}
+          maxLength={MAX_NAME_LENGTH}
+        />
 
         <Text style={styles.label}>Email</Text>
-        <TextInput style={styles.input} value={email} onChangeText={setEmail} autoCapitalize="none" />
+        <TextInput
+          style={styles.input}
+          value={email}
+          onChangeText={setEmail}
+          autoCapitalize="none"
+          keyboardType="email-address"
+          maxLength={MAX_EMAIL_LENGTH}
+        />
 
         <Text style={styles.label}>Role</Text>
         <TouchableOpacity
